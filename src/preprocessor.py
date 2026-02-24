@@ -8,6 +8,8 @@ from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv
 from torch_geometric.utils import negative_sampling
 
+loss_fn = torch.nn.BCEWithLogitsLoss()
+
 class GNN(nn.Module):
     def __init__(self, num_nodes, hidden_dim):
         super().__init__()
@@ -59,20 +61,28 @@ def train(model, optimizer, data):
 
     # Positive edges
     pos_edge_index = data.edge_index
-    pos_score = edge_score(z, pos_edge_index)
-    pos_loss = -torch.log(torch.sigmoid(pos_score)).mean()
+    pos_logits = edge_score(z, pos_edge_index)
+    pos_labels = torch.ones(pos_logits.size(0), device=pos_logits.device)
 
     # Negative edges
     neg_edge_index = negative_sampling(
         edge_index=data.edge_index,
         num_nodes=data.num_nodes,
-        num_neg_samples=pos_edge_index.size(1)
+        num_neg_samples=pos_edge_index.size(1),
     )
-    neg_score = edge_score(z, neg_edge_index)
-    neg_loss = -torch.log(1 - torch.sigmoid(neg_score)).mean()
+    neg_logits = edge_score(z, neg_edge_index)
+    neg_labels = torch.zeros(neg_logits.size(0), device=neg_logits.device)
 
-    loss = pos_loss + neg_loss
+    # Combine
+    logits = torch.cat([pos_logits, neg_logits], dim=0)
+    labels = torch.cat([pos_labels, neg_labels], dim=0)
+
+    loss = loss_fn(logits, labels)
     loss.backward()
+
+    # Optional but recommended
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
     optimizer.step()
     return loss.item()
 
@@ -111,7 +121,7 @@ def generate_embeddings():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GNN(num_nodes=num_nodes, hidden_dim=64).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
     data = data.to(device)
 
     print("Starting training...")
