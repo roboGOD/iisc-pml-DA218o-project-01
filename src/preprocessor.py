@@ -5,24 +5,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_geometric.nn import SAGEConv
 from torch_geometric.utils import negative_sampling
 
 loss_fn = torch.nn.BCEWithLogitsLoss()
 
-class GNN(nn.Module):
-    def __init__(self, num_nodes, hidden_dim):
+class NodeEmbeddingModel(nn.Module):
+    def __init__(self, num_nodes, dim):
         super().__init__()
-        self.node_emb = nn.Embedding(num_nodes, hidden_dim)
-        self.conv1 = SAGEConv(hidden_dim, hidden_dim)
-        self.conv2 = SAGEConv(hidden_dim, hidden_dim)
+        self.emb = nn.Embedding(num_nodes, dim)
+        nn.init.normal_(self.emb.weight, std=0.01)
 
-    def forward(self, edge_index):
-        x = self.node_emb.weight
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = self.conv2(x, edge_index)
-        return x 
+    def forward(self):
+        return self.emb.weight
 
 def read_graph():
     adj = defaultdict(list)
@@ -58,24 +52,22 @@ def train_step(
     model,
     optimizer,
     data,
-    batch_size: int = 65536,
+    batch_size=65536,
 ):
     model.train()
     optimizer.zero_grad()
 
-    # ---- 1. Sample positive edges ----
+    # Sample positive edges
     num_edges = data.edge_index.size(1)
     perm = torch.randint(0, num_edges, (batch_size,), device=data.edge_index.device)
     pos_edge_index = data.edge_index[:, perm]
 
-    # ---- 2. Forward pass ----
-    z = model(data.edge_index)
+    # Embeddings (cheap now)
+    z = model()
 
-    # Positive logits
     pos_logits = edge_score(z, pos_edge_index)
-    pos_labels = torch.ones(pos_logits.size(0), device=pos_logits.device)
+    pos_labels = torch.ones_like(pos_logits)
 
-    # ---- 3. Negative sampling ----
     neg_edge_index = negative_sampling(
         edge_index=data.edge_index,
         num_nodes=data.num_nodes,
@@ -84,16 +76,14 @@ def train_step(
     )
 
     neg_logits = edge_score(z, neg_edge_index)
-    neg_labels = torch.zeros(neg_logits.size(0), device=neg_logits.device)
+    neg_labels = torch.zeros_like(neg_logits)
 
-    # ---- 4. Loss ----
     logits = torch.cat([pos_logits, neg_logits], dim=0)
     labels = torch.cat([pos_labels, neg_labels], dim=0)
 
     loss = loss_fn(logits, labels)
     loss.backward()
 
-    # ---- 5. Stability ----
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
 
@@ -130,7 +120,7 @@ def generate_embeddings(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = data.to(device)
 
-    model = GNN(num_nodes=num_nodes, hidden_dim=64).to(device)
+    model = NodeEmbeddingModel(num_nodes=num_nodes, dim=64).to(device)
 
     # Lower LR for stability on large graphs
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
@@ -151,7 +141,7 @@ def generate_embeddings(
 
     model.eval()
     with torch.no_grad():
-        node_embeddings = model(data.edge_index).cpu()
+        node_embeddings = model().cpu()
 
     save_embeddings(node_embeddings, node_id_to_idx)
     print("Embeddings generated and saved.")
