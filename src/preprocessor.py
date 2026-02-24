@@ -99,11 +99,6 @@ def train_step(
 
     return loss.item()
 
-def predict_edge(u, v, node_embeddings):
-    score = (node_embeddings[u] * node_embeddings[v]).sum()
-    prob = torch.sigmoid(score).item()
-    return prob
-
 def save_embeddings(node_embeddings, node_id_to_idx, path='model/node_embeddings.pt'):
     torch.save(
         {
@@ -114,11 +109,6 @@ def save_embeddings(node_embeddings, node_id_to_idx, path='model/node_embeddings
         }, 
         path
     )
-
-def load_embeddings(path='model/node_embeddings.pt'):
-    ckpt = torch.load(path, map_location="cpu")
-    node_embeddings = ckpt["embeddings"]
-    return node_embeddings
 
 def generate_embeddings(
     max_steps: int = 80_000,
