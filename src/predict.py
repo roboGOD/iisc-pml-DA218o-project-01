@@ -42,7 +42,7 @@ def predict_edges(edge_list, node_embeddings, node_id_to_idx):
         predictions.append((id, prob))
     return predictions
 
-def write_predictions(predictions, path='processed/predictions.csv'):
+def write_predictions(predictions, path='data/processed/predictions.csv'):
     with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Id', 'Predictions'])
