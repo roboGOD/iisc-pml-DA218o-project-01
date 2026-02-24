@@ -101,8 +101,8 @@ def save_embeddings(node_embeddings, node_id_to_idx, path='model/node_embeddings
     )
 
 def generate_embeddings(
-    max_steps: int = 80_000,
-    log_every: int = 1_000,
+    max_steps: int = 100,
+    log_every: int = 1,
 ):
     print("Reading graph...")
     adj = read_graph()
