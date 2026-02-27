@@ -9,11 +9,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
+torch.set_num_threads(os.cpu_count())
+
 
 @dataclass
 class DeepWalkConfig:
     embedding_dim: int = 128
-    walk_length: int = 20
+    walk_length: int = 40
     window_size: int = 5
     num_walks_per_node: int = 4
     num_negative_samples: int = 5
@@ -23,8 +25,8 @@ class DeepWalkConfig:
     num_epochs: int = 5
     val_ratio: float = 0.05
     seed: int = 42
-    log_every_steps: int = 50
-    val_every_steps: int = 200
+    log_every_steps: int = 10
+    val_every_steps: int = 100
     save_every_steps: int = 500
     checkpoint_dir: str = "model/deepwalk"
     checkpoint_name: str = "checkpoint_latest.pt"
@@ -459,10 +461,10 @@ def generate_embeddings(
     batch_nodes: int = 8192,
     skipgram_batch_size: int = 262144,
     lr: float = 0.003,
-    num_epochs: int = 5,
+    num_epochs: int = 20,
     val_ratio: float = 0.05,
     seed: int = 42,
-    log_every_steps: int = 1,
+    log_every_steps: int = 10,
     val_every_steps: int = 100,
     save_every_steps: int = 500,
     checkpoint_dir: str = "model/deepwalk",
