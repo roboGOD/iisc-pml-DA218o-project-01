@@ -246,6 +246,8 @@ def generate_embeddings(
     start_step = 1
     best_threshold = 0.5
     best_metrics = {}
+    
+    torch.set_num_threads(os.cpu_count())
 
     # Resume from checkpoint if requested
     if resume_from and os.path.isfile(resume_from):
