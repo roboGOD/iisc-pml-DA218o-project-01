@@ -18,10 +18,10 @@ class DeepWalkConfig:
     embedding_dim: int = 128
     walk_length: int = 20
     window_size: int = 5
-    num_walks_per_node: int = 4
-    num_negative_samples: int = 5
+    num_walks_per_node: int = 8
+    num_negative_samples: int = 10
     batch_nodes: int = 8192
-    skipgram_batch_size: int = 262144
+    skipgram_batch_size: int = 131072
     lr: float = 0.005
     num_epochs: int = 10
     val_ratio: float = 0.05
@@ -303,6 +303,9 @@ def build_context_pairs_vectorized(walks: np.ndarray, window_size: int, device):
         valid = (c >= 0) & (x >= 0)
         center_parts.append(c[valid])
         context_parts.append(x[valid])
+        # Add symmetric (reversed) pairs
+        center_parts.append(x[valid])
+        context_parts.append(c[valid])
 
     if not center_parts:
         return None, None
@@ -457,17 +460,17 @@ def generate_embeddings(
     embedding_dim: int = 128,
     walk_length: int = 20,
     window_size: int = 5,
-    num_walks_per_node: int = 4,
-    num_negative_samples: int = 5,
+    num_walks_per_node: int = 8,
+    num_negative_samples: int = 10,
     batch_nodes: int = 8192,
-    skipgram_batch_size: int = 262144,
+    skipgram_batch_size: int = 131072,
     lr: float = 0.005,
-    num_epochs: int = 10,
+    num_epochs: int = 15,
     val_ratio: float = 0.05,
     seed: int = 42,
     log_every_steps: int = 10,
     val_every_steps: int = 100,
-    save_every_steps: int = 500,
+    save_every_steps: int = 400,
     checkpoint_dir: str = "model/deepwalk",
     checkpoint_name: str = "checkpoint_latest.pt",
     final_embeddings_path: str = "model/deepwalk_node_embeddings.pt",
@@ -651,6 +654,10 @@ def generate_embeddings(
                 print(msg)
                 log_f.write(msg + "\n")
                 log_f.flush()
+            
+            new_lr = config.lr * (1 - (epoch - 1) / config.num_epochs)
+            for g in optimizer.param_groups:
+                g['lr'] = max(new_lr, 3e-4)
 
     print("Training completed. Running final validation...")
     final_metrics = evaluate_link_prediction(model, val_pos_edges, val_neg_edges, device)
