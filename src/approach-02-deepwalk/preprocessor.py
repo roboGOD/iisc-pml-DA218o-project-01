@@ -15,7 +15,7 @@ torch.set_num_threads(os.cpu_count())
 
 @dataclass
 class DeepWalkConfig:
-    embedding_dim: int = 256
+    embedding_dim: int = 128
     walk_length: int = 40
     window_size: int = 10
     num_walks_per_node: int = 4
@@ -454,7 +454,7 @@ def save_final_embeddings(path, model, node_id_to_idx, best_metrics):
 # ---------------------------------------------------------------------------
 
 def generate_embeddings(
-    embedding_dim: int = 256,
+    embedding_dim: int = 128,
     walk_length: int = 40,
     window_size: int = 10,
     num_walks_per_node: int = 4,
@@ -530,7 +530,6 @@ def generate_embeddings(
     )
 
     model = DirectedDeepWalkModel(num_nodes=num_nodes, dim=config.embedding_dim).to(device)
-    model.half()
     # SparseAdam: only updates momentum/variance for rows with nonzero
     # gradients — critical for 4.87M-node embedding tables.
     optimizer = torch.optim.SparseAdam(model.parameters(), lr=config.lr)
