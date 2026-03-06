@@ -16,13 +16,13 @@ torch.set_num_threads(os.cpu_count())
 @dataclass
 class DeepWalkConfig:
     embedding_dim: int = 128
-    walk_length: int = 40
-    window_size: int = 10
+    walk_length: int = 20
+    window_size: int = 5
     num_walks_per_node: int = 4
     num_negative_samples: int = 5
-    batch_nodes: int = 4096
-    skipgram_batch_size: int = 131072
-    lr: float = 0.001
+    batch_nodes: int = 8192
+    skipgram_batch_size: int = 262144
+    lr: float = 0.005
     num_epochs: int = 10
     val_ratio: float = 0.05
     seed: int = 42
@@ -367,7 +367,7 @@ def train_skipgram_batch(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_link_prediction(model, val_pos_edges, val_neg_edges, device, eval_batch_size: int = 131072):
+def evaluate_link_prediction(model, val_pos_edges, val_neg_edges, device, eval_batch_size: int = 262144):
     """Evaluate link prediction with batched scoring to avoid GPU OOM."""
     model.eval()
 
@@ -455,13 +455,13 @@ def save_final_embeddings(path, model, node_id_to_idx, best_metrics):
 
 def generate_embeddings(
     embedding_dim: int = 128,
-    walk_length: int = 40,
-    window_size: int = 10,
+    walk_length: int = 20,
+    window_size: int = 5,
     num_walks_per_node: int = 4,
     num_negative_samples: int = 5,
-    batch_nodes: int = 4096,
-    skipgram_batch_size: int = 131072,
-    lr: float = 0.001,
+    batch_nodes: int = 8192,
+    skipgram_batch_size: int = 262144,
+    lr: float = 0.005,
     num_epochs: int = 10,
     val_ratio: float = 0.05,
     seed: int = 42,
