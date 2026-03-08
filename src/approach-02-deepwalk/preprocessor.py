@@ -49,7 +49,7 @@ class DeepWalkConfig:
     # batch_nodes=16384: 2x larger node batch per walk round.
     # Produces more (center, context) pairs per GPU step, improving
     # GPU occupancy and amortizing CPU→GPU transfer overhead.
-    batch_nodes: int = 16384
+    batch_nodes: int = 8192
     # skipgram_batch_size=524288 (512K): 4x larger than before.
     # A100 SXM has 80 GB VRAM and 2 TB/s bandwidth — the bottleneck
     # is arithmetic throughput, not memory. Larger sub-batches reduce
@@ -400,7 +400,7 @@ def generate_embeddings(
     window_size: int = 10,
     num_walks_per_node: int = 10,
     num_negative_samples: int = 10,
-    batch_nodes: int = 16384,
+    batch_nodes: int = 8192,
     skipgram_batch_size: int = 131072,
     lr: float = 0.01,
     num_epochs: int = 10,
