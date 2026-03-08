@@ -34,9 +34,9 @@ class DeepWalkConfig:
     embedding_dim: int = 128
 
     # --- Walk hyperparameters ---
-    walk_length: int = 40
-    window_size: int = 10
-    num_walks_per_node: int = 10
+    walk_length: int = 20
+    window_size: int = 5
+    num_walks_per_node: int = 5
     num_negative_samples: int = 10
 
     # --- Batch sizes ---
@@ -433,9 +433,9 @@ def save_final_embeddings(path, model, node_id_to_idx, best_metrics):
 
 def generate_embeddings(
     embedding_dim: int = 128,
-    walk_length: int = 40,
-    window_size: int = 10,
-    num_walks_per_node: int = 10,
+    walk_length: int = 20,
+    window_size: int = 5,
+    num_walks_per_node: int = 5,
     num_negative_samples: int = 10,
     batch_nodes: int = 4096,
     skipgram_batch_size: int = 65536,
