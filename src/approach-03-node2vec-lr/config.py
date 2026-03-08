@@ -11,16 +11,25 @@ GRAPH_CONFIG = {
     "directed": True,
 }
 
-# ── Node2Vec (lightweight config) ─────────────────────────────────────────────
-#   Tuned for large graphs (5M nodes / 24M edges) on limited hardware.
-#   Increase num_walks / walk_length / epochs for better accuracy if compute allows.
+# ── Node2Vec via PecanPy ───────────────────────────────────────────────────────
+#
+#  mode — controls the memory / speed trade-off:
+#
+#    "SparseOTF"  transition probs on-the-fly from sparse matrix
+#                 → lowest RAM (~2–4 GB for 24M edges)   ← default
+#    "DenseOTF"   transition probs on-the-fly from dense matrix
+#                 → faster walks, needs 32 GB+ RAM
+#    "PreComp"    probs precomputed & cached (like the old node2vec library)
+#                 → fastest walks, highest RAM — avoid on large graphs
+#
 NODE2VEC_CONFIG = {
-    "dimensions":  128,   # embedding size — 64 is the sweet spot for LR
+    "mode":        "SparseOTF",  # change to DenseOTF if you have 32 GB+ RAM
+    "dimensions":  128,   # 128 is the minimum for 5M-node Twitter graph
     "walk_length": 20,    # steps per random walk
-    "num_walks":   10,    # walks per node — keep low for speed
-    "p":           2.0,   # return parameter  (1 = neutral BFS/DFS)
-    "q":           0.75,  # in-out parameter  (1 = neutral)
-    "workers":     4,     # parallel workers for walk generation
+    "num_walks":   10,    # walks per node
+    "p":           2.0,   # discourage backtracking — follow chains are directional
+    "q":           0.75,  # slight BFS bias — interest clusters dominate
+    "workers":     4,     # parallel workers (walk gen + Word2Vec)
 }
 
 # ── Word2Vec (gensim) ─────────────────────────────────────────────────────────

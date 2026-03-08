@@ -1,24 +1,36 @@
 """
-Core model: Node2Vec embeddings → Logistic Regression link predictor.
+Core model: Node2Vec embeddings (via PecanPy) → Logistic Regression link predictor.
+
+Why PecanPy over the node2vec library
+──────────────────────────────────────
+The `node2vec` library precomputes and stores transition probabilities for every
+edge before walks begin — O(edges × avg_degree) memory.  On a 24M-edge Twitter
+graph this requires 30–50 GB RAM and hours of preprocessing.
+
+PecanPy fixes both problems:
+  • Transition probs computed on-the-fly during walks → O(edges) memory
+  • Walk generation parallelised with numba JIT → 10–100× faster in practice
+  • Three modes for different memory/speed trade-offs (see fit_embeddings)
+  • Reads a CSR-format graph directly from an edge-list file, bypassing NetworkX
 
 Training workflow
 -----------------
-1. predictor.fit_embeddings(G_train)     — random-walk Node2Vec
-2. predictor.fit_classifier(pos, neg)    — LR on Hadamard edge features
-3. predictor.evaluate(pos, neg, "val")   — print + return metrics
-4. predictor.predict(edges)              — binary 0 / 1 labels
-5. predictor.predict_proba(edges)        — probability scores
-6. predictor.save(...)  /  .load(...)    — model persistence
+1. predictor.fit_embeddings(edge_list_path)  — PecanPy Node2Vec walks
+2. predictor.fit_classifier(pos, neg)        — LR on Hadamard edge features
+3. predictor.evaluate(pos, neg, "val")       — print + return metrics
+4. predictor.predict(edges)                  — binary 0 / 1 labels
+5. predictor.predict_proba(edges)            — probability scores
+6. predictor.save(...)  /  .load(...)        — model persistence
 """
 import logging
 import os
-from typing import Dict, List, Tuple
+import tempfile
+from typing import Dict, List, Optional, Tuple
 
 import joblib
 import networkx as nx
 import numpy as np
-from gensim.models import Word2Vec
-from node2vec import Node2Vec
+from pecanpy import pecanpy as ppy
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
@@ -35,10 +47,28 @@ from features import build_dataset, edge_features
 
 logger = logging.getLogger(__name__)
 
+# PecanPy modes — choose based on available RAM:
+#
+#   SparseOTF  — transition probs computed on-the-fly from a sparse adjacency
+#                matrix.  Lowest memory (a few GB for 24M edges).
+#                Best default for large graphs on limited hardware.
+#
+#   DenseOTF   — probs computed on-the-fly from a dense matrix.  Faster walks
+#                than SparseOTF but uses more RAM.  Good if you have 32 GB+.
+#
+#   PreComp    — probs precomputed and cached (closest to the node2vec library).
+#                Fastest walk generation but highest memory — only viable for
+#                small-to-medium graphs.
+_PECANPY_MODES = {
+    "SparseOTF": ppy.SparseOTF,
+    "DenseOTF":  ppy.DenseOTF,
+    "PreComp":   ppy.PreComp,
+}
+
 
 class Node2VecLinkPredictor:
     """
-    Directed link-prediction via Node2Vec embeddings + Logistic Regression.
+    Directed link-prediction via PecanPy Node2Vec embeddings + Logistic Regression.
 
     All heavy lifting is split into explicit steps so each stage can be
     inspected, swapped, or rerun independently.
@@ -60,46 +90,118 @@ class Node2VecLinkPredictor:
 
         self.wv         = None   # gensim KeyedVectors (after fit_embeddings)
         self.classifier = None   # sklearn Pipeline (after fit_classifier)
-        self._dim       = n2v_config.get("dimensions", 64)
+        self._dim       = n2v_config.get("dimensions", 128)
 
     # ── Step 1: Embeddings ─────────────────────────────────────────────────────
 
-    def fit_embeddings(self, G: nx.DiGraph) -> None:
+    def fit_embeddings(
+        self,
+        G:              nx.DiGraph,
+        edge_list_path: Optional[str] = None,
+    ) -> None:
         """
-        Generate Node2Vec random-walk embeddings on the training graph.
+        Generate Node2Vec random-walk embeddings using PecanPy.
 
-        Node IDs are converted to strings internally by the node2vec library;
-        we store only the KeyedVectors for a smaller memory footprint.
+        PecanPy reads an edge-list file rather than a NetworkX object.
+        If ``edge_list_path`` points to an already-written edge list that
+        matches G, it is used directly (saves I/O).  Otherwise the edges of G
+        are written to a temporary file automatically.
+
+        Edge-list format expected by PecanPy (tab-separated, no header):
+            src_node  dst_node  [weight]
+        Weights are optional; unweighted edges are written without a weight
+        column and PecanPy treats them as weight 1.0.
+
+        Parameters
+        ----------
+        G              : training graph (val/test edges already removed)
+        edge_list_path : optional path to a pre-written edge list for G;
+                         when None a temp file is created and deleted after use
         """
+        mode_name = self.n2v_config.get("mode", "SparseOTF")
+        if mode_name not in _PECANPY_MODES:
+            raise ValueError(
+                f"Unknown PecanPy mode '{mode_name}'. "
+                f"Valid options: {list(_PECANPY_MODES.keys())}"
+            )
+
         logger.info(
-            "Running Node2Vec  "
-            f"(dim={self.n2v_config['dimensions']}, "
+            f"Running PecanPy Node2Vec  "
+            f"(mode={mode_name}, "
+            f"dim={self.n2v_config['dimensions']}, "
             f"walks={self.n2v_config['num_walks']} × {self.n2v_config['walk_length']} steps, "
-            f"p={self.n2v_config['p']}, q={self.n2v_config['q']}) ..."
+            f"p={self.n2v_config['p']}, q={self.n2v_config['q']}, "
+            f"workers={self.n2v_config['workers']}) ..."
         )
 
-        n2v = Node2Vec(
-            G,
-            dimensions=self.n2v_config["dimensions"],
-            walk_length=self.n2v_config["walk_length"],
-            num_walks=self.n2v_config["num_walks"],
-            p=self.n2v_config["p"],
-            q=self.n2v_config["q"],
-            workers=self.n2v_config["workers"],
-            seed=self.seed,
-            quiet=False,
-        )
+        # ── Write edge list if not provided ────────────────────────────────────
+        _tmp_file  = None
+        _owns_file = edge_list_path is None
 
-        w2v_model = n2v.fit(
-            window=self.w2v_config["window"],
-            min_count=self.w2v_config["min_count"],
-            sg=self.w2v_config["sg"],
-            epochs=self.w2v_config["epochs"],
-            batch_words=self.w2v_config["batch_words"],
-        )
+        if _owns_file:
+            # Write to a named temp file; PecanPy needs a real path on disk
+            _tmp_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".edgelist", delete=False
+            )
+            logger.info(f"Writing edge list to temp file '{_tmp_file.name}' ...")
+            for u, v in G.edges():
+                _tmp_file.write(f"{u}\t{v}\n")
+            _tmp_file.flush()
+            _tmp_file.close()
+            edge_list_path = _tmp_file.name
+
+        try:
+            # ── Initialise PecanPy graph ───────────────────────────────────────
+            g = _PECANPY_MODES[mode_name](
+                p=self.n2v_config["p"],
+                q=self.n2v_config["q"],
+                workers=self.n2v_config["workers"],
+                verbose=True,
+                extend=False,          # standard Node2Vec (not Node2Vec+)
+            )
+
+            # directed=True preserves edge direction in walks
+            # weighted=False since we have no edge weights
+            g.read_edg(
+                edge_list_path,
+                weighted=False,
+                directed=True,
+            )
+
+            # ── Generate walks ─────────────────────────────────────────────────
+            logger.info("Generating random walks ...")
+            walks = g.simulate_walks(
+                num_walks=self.n2v_config["num_walks"],
+                walk_length=self.n2v_config["walk_length"],
+            )
+
+            # ── Train Word2Vec (Skip-Gram) on the walks ────────────────────────
+            # PecanPy returns walks as lists of strings (node IDs as str).
+            # We pass them directly to gensim Word2Vec.
+            logger.info("Training Word2Vec on walks ...")
+            from gensim.models import Word2Vec
+
+            w2v = Word2Vec(
+                sentences=walks,
+                vector_size=self.n2v_config["dimensions"],
+                window=self.w2v_config["window"],
+                min_count=self.w2v_config["min_count"],
+                sg=self.w2v_config["sg"],
+                epochs=self.w2v_config["epochs"],
+                workers=self.n2v_config["workers"],
+                seed=self.seed,
+            )
+
+        finally:
+            # Always clean up the temp file even if training raises
+            if _owns_file and _tmp_file is not None:
+                try:
+                    os.unlink(_tmp_file.name)
+                except OSError:
+                    pass
 
         # Keep only the lightweight KeyedVectors; discard the full Word2Vec model
-        self.wv   = w2v_model.wv
+        self.wv   = w2v.wv
         self._dim = self.n2v_config["dimensions"]
         logger.info(f"Embeddings ready  →  {len(self.wv):,} nodes covered.")
 
@@ -228,3 +330,4 @@ class Node2VecLinkPredictor:
 
         logger.info("Model loaded successfully.")
         return instance
+    
