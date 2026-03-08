@@ -412,7 +412,7 @@ def generate_embeddings(
     checkpoint_dir: str = "model/deepwalk",
     checkpoint_name: str = "checkpoint_latest.pt",
     final_embeddings_path: str = "model/deepwalk_node_embeddings.pt",
-    resume_from: str = None,
+    resume_from: str = 'model/deepwalk/dw_checkpoint_v2_s800.pt',
 ):
     config = DeepWalkConfig(
         embedding_dim=embedding_dim,
