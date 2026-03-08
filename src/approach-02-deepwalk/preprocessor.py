@@ -18,7 +18,7 @@ class DeepWalkConfig:
     embedding_dim: int = 128
     walk_length: int = 20
     window_size: int = 5
-    num_walks_per_node: int = 8
+    num_walks_per_node: int = 5
     num_negative_samples: int = 10
     batch_nodes: int = 8192
     skipgram_batch_size: int = 131072
@@ -304,8 +304,8 @@ def build_context_pairs_vectorized(walks: np.ndarray, window_size: int, device):
         center_parts.append(c[valid])
         context_parts.append(x[valid])
         # Add symmetric (reversed) pairs
-        center_parts.append(x[valid])
-        context_parts.append(c[valid])
+        # center_parts.append(x[valid])
+        # context_parts.append(c[valid])
 
     if not center_parts:
         return None, None
@@ -460,7 +460,7 @@ def generate_embeddings(
     embedding_dim: int = 128,
     walk_length: int = 20,
     window_size: int = 5,
-    num_walks_per_node: int = 8,
+    num_walks_per_node: int = 5,
     num_negative_samples: int = 10,
     batch_nodes: int = 8192,
     skipgram_batch_size: int = 131072,
