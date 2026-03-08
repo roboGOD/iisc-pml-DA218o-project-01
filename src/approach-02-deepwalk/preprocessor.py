@@ -18,17 +18,50 @@ torch.set_num_threads(os.cpu_count())
 
 @dataclass
 class DeepWalkConfig:
-    embedding_dim: int = 128
-    walk_length: int = 20
-    window_size: int = 5
-    num_walks_per_node: int = 5
-    num_negative_samples: int = 10
-    batch_nodes: int = 8192
-    skipgram_batch_size: int = 131072
-    lr: float = 0.005
+    # --- Embedding ---
+    # 256 vs 128: A100 has 80 GB VRAM — two 4.87M×256 tables cost ~10 GB
+    # (fp32), well within budget. Richer embeddings improve link prediction
+    # quality with no runtime penalty on A100's 2 TB/s HBM2e.
+    embedding_dim: int = 256
+
+    # --- Walk hyperparameters ---
+    # walk_length=40: longer context captures higher-order neighborhoods.
+    # Doubled from 20 — CPU walk gen is the bottleneck, not GPU, so the
+    # extra pairs are "free" from a GPU utilization standpoint.
+    walk_length: int = 40
+    # window_size=10: wider context window pairs with the longer walk.
+    # Pairs scale as O(walk_length × window_size), so GPU batch sizes
+    # below absorb the ~4x increase comfortably.
+    window_size: int = 10
+    # num_walks_per_node=10: 2x more walks → denser training signal.
+    # Each node batch of 16 384 launches 163 840 walkers — still fast
+    # with vectorized numpy walks on a 48-core RunPod CPU.
+    num_walks_per_node: int = 10
+    # num_negative_samples=15: more negatives sharpen the decision boundary.
+    # Memory cost: (skipgram_batch_size × 15 × 256) ≈ 1.6 GB peak — fine
+    # on 80 GB VRAM.
+    num_negative_samples: int = 15
+
+    # --- Batch sizes ---
+    # batch_nodes=16384: 2x larger node batch per walk round.
+    # Produces more (center, context) pairs per GPU step, improving
+    # GPU occupancy and amortizing CPU→GPU transfer overhead.
+    batch_nodes: int = 16384
+    # skipgram_batch_size=524288 (512K): 4x larger than before.
+    # A100 SXM has 80 GB VRAM and 2 TB/s bandwidth — the bottleneck
+    # is arithmetic throughput, not memory. Larger sub-batches reduce
+    # kernel-launch overhead and improve SM utilization.
+    skipgram_batch_size: int = 524288
+
+    # --- Optimizer ---
+    # lr=0.01: scale lr with effective batch size (linear scaling rule).
+    # batch_nodes×num_walks×pairs/walk is ~4x larger → lr ×2 is conservative.
+    lr: float = 0.01
     num_epochs: int = 10
     val_ratio: float = 0.05
     seed: int = 42
+
+    # --- Logging / checkpointing ---
     log_every_steps: int = 10
     val_every_steps: int = 100
     save_every_steps: int = 500
@@ -359,14 +392,14 @@ def save_final_embeddings(path, model, node_id_to_idx, best_metrics):
 # ---------------------------------------------------------------------------
 
 def generate_embeddings(
-    embedding_dim: int = 128,
-    walk_length: int = 20,
-    window_size: int = 5,
-    num_walks_per_node: int = 5,
-    num_negative_samples: int = 10,
-    batch_nodes: int = 8192,
-    skipgram_batch_size: int = 131072,
-    lr: float = 0.005,
+    embedding_dim: int = 256,
+    walk_length: int = 40,
+    window_size: int = 10,
+    num_walks_per_node: int = 10,
+    num_negative_samples: int = 15,
+    batch_nodes: int = 16384,
+    skipgram_batch_size: int = 524288,
+    lr: float = 0.01,
     num_epochs: int = 10,
     val_ratio: float = 0.05,
     seed: int = 42,
