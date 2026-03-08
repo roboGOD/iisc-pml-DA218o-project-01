@@ -54,7 +54,7 @@ class DeepWalkConfig:
     # A100 SXM has 80 GB VRAM and 2 TB/s bandwidth — the bottleneck
     # is arithmetic throughput, not memory. Larger sub-batches reduce
     # kernel-launch overhead and improve SM utilization.
-    skipgram_batch_size: int = 524288
+    skipgram_batch_size: int = 131072
 
     # --- Optimizer ---
     # lr=0.01: scale lr with effective batch size (linear scaling rule).
@@ -401,7 +401,7 @@ def generate_embeddings(
     num_walks_per_node: int = 10,
     num_negative_samples: int = 10,
     batch_nodes: int = 16384,
-    skipgram_batch_size: int = 524288,
+    skipgram_batch_size: int = 131072,
     lr: float = 0.01,
     num_epochs: int = 10,
     val_ratio: float = 0.05,
