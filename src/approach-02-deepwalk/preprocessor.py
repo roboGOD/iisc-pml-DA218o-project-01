@@ -1,5 +1,9 @@
 import csv
 import os
+
+# Reduces CUDA allocator fragmentation — must be set before any CUDA ops.
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -15,17 +19,40 @@ torch.set_num_threads(os.cpu_count())
 
 @dataclass
 class DeepWalkConfig:
+    # --- Embedding ---
+    # VRAM budget with CPU-resident embeddings (4.87M nodes, fp32):
+    #   Embedding weights live in CPU RAM — NOT in VRAM.
+    #   SparseAdam moments also stay in CPU RAM.
+    #   Only the looked-up row vectors are transferred to GPU for matmul.
+    #
+    #   CPU RAM cost: 2 tables × 3 tensors (weight+m1+m2) × 4.87M × 128 × 4B = 15 GB
+    #   VRAM cost:    skipgram_batch_size × (1 + neg) × dim × 4B per forward pass
+    #                 e.g. 65536 × 11 × 128 × 4B ≈ 360 MB peak  ← fits easily
+    #
+    # This resolves the "Tried to allocate 26.81 GiB" OOM — the SparseAdam
+    # moment tensors were materialising in VRAM and consuming 20+ GB.
     embedding_dim: int = 128
+
+    # --- Walk hyperparameters ---
     walk_length: int = 20
     window_size: int = 5
     num_walks_per_node: int = 5
     num_negative_samples: int = 10
-    batch_nodes: int = 8192
-    skipgram_batch_size: int = 131072
-    lr: float = 0.005
+
+    # --- Batch sizes ---
+    # batch_nodes: number of source nodes per walk round.
+    batch_nodes: int = 4096
+    # skipgram_batch_size: pairs processed per gradient accumulation step.
+    # With CPU embeddings the GPU peak is tiny, so 65536 is very safe.
+    skipgram_batch_size: int = 65536
+
+    # --- Optimizer ---
+    lr: float = 0.01
     num_epochs: int = 10
     val_ratio: float = 0.05
     seed: int = 42
+
+    # --- Logging / checkpointing ---
     log_every_steps: int = 10
     val_every_steps: int = 100
     save_every_steps: int = 500
@@ -34,24 +61,60 @@ class DeepWalkConfig:
     final_embeddings_path: str = "model/deepwalk_node_embeddings.pt"
 
 
+# ---------------------------------------------------------------------------
+# Model — CPU-resident embeddings, GPU matmul
+# ---------------------------------------------------------------------------
+
 class DirectedDeepWalkModel(nn.Module):
+    """Skip-gram model with CPU-resident sparse embeddings.
+
+    WHY CPU EMBEDDINGS:
+    With 4.87M nodes and dim=128, the two embedding tables alone use
+    2 x 4.87M x 128 x 4B = 5 GB of VRAM. SparseAdam then allocates two
+    moment tensors (m1, m2) of the same shape = 10 GB more -> 15 GB just
+    for optimizer state, leaving little room for training tensors.
+
+    By keeping embedding weights on CPU (sparse=True, device='cpu'):
+      - Embedding tables + moments live in CPU RAM (typically 128-512 GB).
+      - Only the looked-up rows (~batch x dim floats) are moved to GPU.
+      - GPU VRAM holds only the active mini-batch vectors, not the full table.
+
+    PERFORMANCE:
+    The CPU->GPU transfer per batch is ~65536 x 128 x 4B = 32 MB, which
+    takes ~0.5 ms on PCIe -- negligible vs the matmul time.
+    The backward pass writes sparse gradients back to CPU RAM via
+    SparseAdam, which is fast because only touched rows are updated.
+    """
+
     def __init__(self, num_nodes: int, dim: int):
         super().__init__()
-        # sparse=True: gradients are sparse tensors, enabling SparseAdam
-        # and avoiding dense gradient allocation for 4.87M-row tables.
+        # sparse=True: gradients are sparse COO tensors — only rows used in
+        # the forward pass get gradient entries. Required for SparseAdam.
+        # No .to(device) call — these stay on CPU intentionally.
         self.in_emb = nn.Embedding(num_nodes, dim, sparse=True)
         self.out_emb = nn.Embedding(num_nodes, dim, sparse=True)
-        # xavier_uniform_ uses fan_in=num_nodes, producing near-zero values
-        # (~0.001) for large graphs.  Dot products ≈ 0, sigmoid ≈ 0.5, and
-        # gradients carry no directional signal → AUC stuck at 0.50.
-        # uniform(-0.5, 0.5) gives dot-product std ≈ 0.94 — meaningful spread.
         init_range = 0.5
         nn.init.uniform_(self.in_emb.weight, -init_range, init_range)
         nn.init.uniform_(self.out_emb.weight, -init_range, init_range)
 
-    def score(self, src_idx: torch.Tensor, dst_idx: torch.Tensor) -> torch.Tensor:
-        src = self.in_emb(src_idx)
-        dst = self.out_emb(dst_idx)
+    def get_vecs(self, idx: torch.Tensor, emb: nn.Embedding, gpu_device: torch.device) -> torch.Tensor:
+        """Look up rows on CPU, transfer only the compact result to GPU.
+
+        idx is a GPU int64 tensor of node indices. We move it to CPU for
+        the embedding lookup (avoids full-table transfer), then push only
+        the B x dim result back to GPU for dot-product math.
+        """
+        cpu_vecs = emb(idx.cpu())          # CPU lookup: [B, dim]
+        return cpu_vecs.to(gpu_device)     # push B x dim to GPU
+
+    def score(
+        self,
+        src_idx: torch.Tensor,
+        dst_idx: torch.Tensor,
+        gpu_device: torch.device,
+    ) -> torch.Tensor:
+        src = self.get_vecs(src_idx, self.in_emb, gpu_device)
+        dst = self.get_vecs(dst_idx, self.out_emb, gpu_device)
         return (src * dst).sum(dim=-1)
 
 
@@ -96,50 +159,11 @@ def split_train_val_edges(edges, val_ratio: float, seed: int):
     num_val = max(1, int(len(edges_arr) * val_ratio))
     val_idx = perm[:num_val]
     train_idx = perm[num_val:]
-    train_edges = edges_arr[train_idx]
-    val_pos_edges = edges_arr[val_idx]
-    return train_edges, val_pos_edges
-
-
-def build_out_adjacency(num_nodes: int, edges: np.ndarray):
-    out_adj = [[] for _ in range(num_nodes)]
-    for src, dst in edges:
-        out_adj[int(src)].append(int(dst))
-    return out_adj
-
-
-def build_bidirectional_adjacency(num_nodes: int, edges: np.ndarray):
-    """Build adjacency with both forward AND reverse edges for walking.
-
-    In a directed graph many nodes are sink nodes (out-degree = 0).
-    Forward-only walks die instantly on those nodes, producing near-zero
-    training pairs.  Adding reverse edges lets walks traverse the full
-    graph, giving every reachable node a chance to appear in training.
-    Scoring remains directional via separate in_emb / out_emb.
-    """
-    adj = [[] for _ in range(num_nodes)]
-    for src, dst in edges:
-        s, d = int(src), int(dst)
-        adj[s].append(d)
-        adj[d].append(s)
-    reachable = sum(1 for nbrs in adj if nbrs)
-    print(f"  Walk adjacency: {reachable}/{num_nodes} nodes reachable "
-          f"({100.0 * reachable / num_nodes:.1f}%)")
-    return adj
+    return edges_arr[train_idx], edges_arr[val_idx]
 
 
 def build_csr_bidirectional(num_nodes: int, edges: np.ndarray):
-    """Build CSR-format bidirectional adjacency for vectorized walks.
-
-    Returns (indptr, indices, degree) where:
-      - indptr[i] .. indptr[i+1]  index into `indices` for node i's neighbors
-      - indices[indptr[i]:indptr[i+1]]  are the neighbor node ids
-      - degree[i]  is the number of neighbors of node i
-
-    Using CSR instead of list-of-lists:
-      - ~400 MB vs ~3-4 GB for 48M bidirectional edges
-      - Enables fully vectorized walk generation
-    """
+    """Build CSR-format bidirectional adjacency for vectorized walks."""
     src = np.concatenate([edges[:, 0], edges[:, 1]])
     dst = np.concatenate([edges[:, 1], edges[:, 0]])
 
@@ -160,7 +184,6 @@ def build_csr_bidirectional(num_nodes: int, edges: np.ndarray):
 
 
 def sample_negative_edges(num_samples: int, num_nodes: int, edge_set_encoded: set, seed: int):
-    """Sample negative edges. edge_set_encoded uses int-encoded edges (src * num_nodes + dst)."""
     rng = np.random.default_rng(seed)
     negatives = np.empty((num_samples, 2), dtype=np.int64)
     filled = 0
@@ -171,7 +194,6 @@ def sample_negative_edges(num_samples: int, num_nodes: int, edge_set_encoded: se
         src = rng.integers(0, num_nodes, size=chunk, dtype=np.int64)
         dst = rng.integers(0, num_nodes, size=chunk, dtype=np.int64)
 
-        # Vectorized self-loop filter
         mask = src != dst
         src, dst = src[mask], dst[mask]
         encoded = src * num_nodes + dst
@@ -188,39 +210,14 @@ def sample_negative_edges(num_samples: int, num_nodes: int, edge_set_encoded: se
 
 
 # ---------------------------------------------------------------------------
-# Walk + skip-gram batching
+# Walk generation
 # ---------------------------------------------------------------------------
-
-def generate_directed_walks(source_nodes, out_adj, walk_length: int, num_walks_per_node: int, rng):
-    walks = []
-    for src in source_nodes:
-        src = int(src)
-        for _ in range(num_walks_per_node):
-            walk = [src]
-            cur = src
-            for _ in range(walk_length - 1):
-                nbrs = out_adj[cur]
-                if not nbrs:
-                    break
-                cur = int(rng.choice(nbrs))
-                walk.append(cur)
-            if len(walk) > 1:
-                walks.append(walk)
-    return walks
-
 
 def generate_walks_vectorized(
     source_nodes: np.ndarray, indptr: np.ndarray, indices: np.ndarray,
     degree: np.ndarray, walk_length: int, num_walks: int, rng,
 ) -> np.ndarray:
-    """Generate random walks for all source nodes in parallel using numpy.
-
-    Instead of 655K+ Python-level rng.choice() calls per step,
-    this does `walk_length` vectorized numpy operations — ~100x faster.
-
-    Returns walks array of shape (num_walkers, walk_length) with -1
-    for terminated positions (walkers that hit isolated nodes).
-    """
+    """Vectorized random walks on CPU (graph CSR lives in CPU RAM)."""
     walkers = np.repeat(source_nodes, num_walks)
     num_walkers = len(walkers)
 
@@ -231,137 +228,116 @@ def generate_walks_vectorized(
     for step in range(1, walk_length):
         cur = walks[alive, step - 1]
         cur_deg = degree[cur]
-
         has_nbrs = cur_deg > 0
         alive_idx = np.where(alive)[0]
-
-        # Kill walkers at dead-end nodes
         alive[alive_idx[~has_nbrs]] = False
-
         active_idx = alive_idx[has_nbrs]
         if len(active_idx) == 0:
             break
-
         active_nodes = cur[has_nbrs]
         active_deg = cur_deg[has_nbrs]
-
-        # Vectorized random neighbor selection
         rand_offset = (rng.random(len(active_idx)) * active_deg).astype(np.int64)
-        next_nodes = indices[indptr[active_nodes] + rand_offset]
-        walks[active_idx, step] = next_nodes
+        walks[active_idx, step] = indices[indptr[active_nodes] + rand_offset]
 
     return walks
 
 
-def build_forward_context_pairs(walks, window_size: int, device):
-    """Build (center, context) pairs using forward-only windows for directed walks.
+def build_context_pairs_vectorized(walks: np.ndarray, window_size: int, device: torch.device):
+    """Build (center, context) GPU int64 tensors from walk array.
 
-    Uses numpy offset vectorization: for each offset w in [1, window_size],
-    pair every node at position p with the node at position p+w.
-    This produces the same pairs as the naive nested loop but avoids
-    creating thousands of small tensors.
-    """
-    center_chunks = []
-    context_chunks = []
-
-    for walk in walks:
-        length = len(walk)
-        if length <= 1:
-            continue
-        arr = np.array(walk, dtype=np.int64)
-        for w in range(1, window_size + 1):
-            if w >= length:
-                break
-            center_chunks.append(arr[:length - w])
-            context_chunks.append(arr[w:length])
-
-    if not center_chunks:
-        return None, None
-
-    centers_np = np.concatenate(center_chunks)
-    contexts_np = np.concatenate(context_chunks)
-    return (
-        torch.from_numpy(centers_np).to(device),
-        torch.from_numpy(contexts_np).to(device),
-    )
-
-
-def build_context_pairs_vectorized(walks: np.ndarray, window_size: int, device):
-    """Build (center, context) pairs from a 2D walk array (vectorized).
-
-    For each offset w in [1, window_size], slices the entire 2D walks
-    array at once and filters invalid (-1) positions. This replaces
-    the per-walk Python loop with `window_size` numpy operations.
+    Assembled on CPU then transferred as compact int64 tensors.
+    No pin_memory() — avoids persistent pinned allocations that fragment
+    the CUDA allocator over thousands of iterations.
     """
     walk_length = walks.shape[1]
-    center_parts = []
-    context_parts = []
+    center_parts, context_parts = [], []
 
     for w in range(1, min(window_size + 1, walk_length)):
         c = walks[:, :walk_length - w]
-        x = walks[:, w:walk_length]
+        x = walks[:, w:]
         valid = (c >= 0) & (x >= 0)
         center_parts.append(c[valid])
         context_parts.append(x[valid])
-        # Add symmetric (reversed) pairs
-        # center_parts.append(x[valid])
-        # context_parts.append(c[valid])
 
     if not center_parts:
         return None, None
 
     centers_np = np.concatenate(center_parts)
     contexts_np = np.concatenate(context_parts)
+    del center_parts, context_parts
 
     if len(centers_np) == 0:
         return None, None
 
-    return (
-        torch.from_numpy(centers_np).to(device),
-        torch.from_numpy(contexts_np).to(device),
-    )
+    # Transfer int64 index tensors to GPU — small (B x 8 bytes each).
+    centers = torch.from_numpy(centers_np).to(device)
+    contexts = torch.from_numpy(contexts_np).to(device)
+    del centers_np, contexts_np
+    return centers, contexts
 
+
+# ---------------------------------------------------------------------------
+# Skip-gram training
+# ---------------------------------------------------------------------------
 
 def train_skipgram_batch(
-    model, optimizer, centers, contexts, num_nodes: int,
-    num_negative_samples: int, skipgram_batch_size: int = 65536,
-):
-    """Train one skip-gram step with gradient-accumulating sub-batches.
+    model: DirectedDeepWalkModel,
+    optimizer: torch.optim.Optimizer,
+    centers: torch.Tensor,
+    contexts: torch.Tensor,
+    num_nodes: int,
+    num_negative_samples: int,
+    gpu_device: torch.device,
+    skipgram_batch_size: int = 65536,
+) -> float:
+    """Gradient-accumulating skip-gram update with CPU-resident embeddings.
 
-    Without sub-batching, the negative-sampling tensors for ~1-2M pairs
-    (e.g. (2M, 5, 128)) easily exceed GPU memory.  Sub-batching keeps
-    peak memory proportional to skipgram_batch_size instead.
+    Flow per sub-batch:
+      1. Sample neg_nodes on GPU (tiny int tensor).
+      2. Look up center, context, neg vecs: CPU embedding -> transfer to GPU.
+      3. Compute dot products on GPU.
+      4. Backward writes sparse CPU gradients to embedding tables.
+      5. del all GPU intermediates before next sub-batch.
+
+    Peak VRAM = skipgram_batch_size x (2 + neg) x dim x 4B
+              = 65536 x 12 x 128 x 4 ~= 384 MB — well within any GPU budget.
     """
     optimizer.zero_grad()
     total_loss = 0.0
     num_pairs = centers.size(0)
 
     for i in range(0, num_pairs, skipgram_batch_size):
-        c = centers[i:i + skipgram_batch_size]
-        ctx = contexts[i:i + skipgram_batch_size]
+        c = centers[i:i + skipgram_batch_size]      # GPU int64 [B]
+        ctx = contexts[i:i + skipgram_batch_size]   # GPU int64 [B]
 
-        pos_logits = model.score(c, ctx)
-        pos_loss = F.logsigmoid(pos_logits)
+        # --- Positive scores ---
+        # Look up on CPU, push compact row vectors to GPU.
+        center_pos_vec = model.in_emb(c.cpu()).to(gpu_device)    # [B, dim]
+        context_vec    = model.out_emb(ctx.cpu()).to(gpu_device)  # [B, dim]
+        pos_logits = (center_pos_vec * context_vec).sum(dim=-1)  # [B]
+        pos_loss   = F.logsigmoid(pos_logits)                    # [B]
 
+        # --- Negative scores ---
         neg_nodes = torch.randint(
-            low=0, high=num_nodes,
-            size=(c.size(0), num_negative_samples),
-            device=c.device,
-        )
-        center_vec = model.in_emb(c).unsqueeze(1)
-        neg_vec = model.out_emb(neg_nodes)
-        neg_logits = (center_vec * neg_vec).sum(dim=-1)
-        neg_loss = F.logsigmoid(-neg_logits).sum(dim=1)
+            0, num_nodes, (c.size(0), num_negative_samples), device=gpu_device
+        )  # [B, neg] — sampled directly on GPU
+        neg_vec = model.out_emb(neg_nodes.cpu()).to(gpu_device)  # [B, neg, dim]
+        # Reuse center_pos_vec (same center nodes) for negative scoring.
+        neg_logits = (center_pos_vec.unsqueeze(1) * neg_vec).sum(dim=-1)  # [B, neg]
+        neg_loss   = F.logsigmoid(-neg_logits).sum(dim=1)                 # [B]
 
-        # Scale by sub-batch fraction so accumulated gradients equal the
-        # full-batch mean gradient.
         sub_loss = -(pos_loss + neg_loss).sum() / num_pairs
         sub_loss.backward()
         total_loss += float(sub_loss.item())
 
-    # Note: gradient clipping is removed — logsigmoid has bounded gradients,
-    # and clip_grad_norm_ is incompatible with sparse embedding gradients.
+        # Explicitly free every GPU intermediate before the next sub-batch.
+        del c, ctx, center_pos_vec, context_vec, pos_logits, pos_loss
+        del neg_nodes, neg_vec, neg_logits, neg_loss, sub_loss
+
     optimizer.step()
+
+    # Reclaim any CUDA cache freed above.
+    torch.cuda.empty_cache()
     return total_loss
 
 
@@ -370,31 +346,36 @@ def train_skipgram_batch(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_link_prediction(model, val_pos_edges, val_neg_edges, device, eval_batch_size: int = 262144):
-    """Evaluate link prediction with batched scoring to avoid GPU OOM."""
+def evaluate_link_prediction(
+    model: DirectedDeepWalkModel,
+    val_pos_edges: np.ndarray,
+    val_neg_edges: np.ndarray,
+    device: torch.device,
+    eval_batch_size: int = 131072,
+):
+    """Batched link-prediction evaluation with CPU-resident embeddings."""
     model.eval()
 
     def _batched_scores(edges_np):
         all_scores = []
         for i in range(0, len(edges_np), eval_batch_size):
             batch = torch.as_tensor(edges_np[i:i + eval_batch_size], dtype=torch.long, device=device)
-            scores = torch.sigmoid(model.score(batch[:, 0], batch[:, 1])).cpu().numpy()
+            scores = torch.sigmoid(model.score(batch[:, 0], batch[:, 1], device)).cpu().numpy()
             all_scores.append(scores)
+            del batch, scores
         return np.concatenate(all_scores)
 
     pos_scores = _batched_scores(val_pos_edges)
     neg_scores = _batched_scores(val_neg_edges)
-
     pos_mean = float(pos_scores.mean())
     neg_mean = float(neg_scores.mean())
 
-    labels = np.concatenate(
-        [np.ones_like(pos_scores, dtype=np.int64), np.zeros_like(neg_scores, dtype=np.int64)]
-    )
+    labels = np.concatenate([np.ones(len(pos_scores), dtype=np.int64),
+                              np.zeros(len(neg_scores), dtype=np.int64)])
     scores = np.concatenate([pos_scores, neg_scores])
 
     auc = roc_auc_score(labels, scores)
-    ap = average_precision_score(labels, scores)
+    ap  = average_precision_score(labels, scores)
 
     best_f1, best_thr = 0.0, 0.5
     for thr in np.arange(0.05, 0.96, 0.01):
@@ -403,7 +384,7 @@ def evaluate_link_prediction(model, val_pos_edges, val_neg_edges, device, eval_b
         fp = ((preds == 1) & (labels == 0)).sum()
         fn = ((preds == 0) & (labels == 1)).sum()
         precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
+        recall    = tp / (tp + fn + 1e-8)
         f1 = 2 * precision * recall / (precision + recall + 1e-8)
         if f1 > best_f1:
             best_f1, best_thr = float(f1), float(thr)
@@ -416,40 +397,34 @@ def evaluate_link_prediction(model, val_pos_edges, val_neg_edges, device, eval_b
 
 
 def save_checkpoint(path, model, optimizer, epoch, step, best_metrics, node_id_to_idx, config):
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "epoch": epoch,
-            "step": step,
-            "best_metrics": best_metrics,
-            "node_id_to_idx": node_id_to_idx,
-            "config": config.__dict__,
-        },
-        path,
-    )
+    torch.save({
+        "model_state_dict":     model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch":          epoch,
+        "step":           step,
+        "best_metrics":   best_metrics,
+        "node_id_to_idx": node_id_to_idx,
+        "config":         config.__dict__,
+    }, path)
 
 
 def save_final_embeddings(path, model, node_id_to_idx, best_metrics):
     model.eval()
     with torch.no_grad():
-        src_embeddings = model.in_emb.weight.detach().cpu()
-        dst_embeddings = model.out_emb.weight.detach().cpu()
-        merged_embeddings = ((src_embeddings + dst_embeddings) / 2.0).contiguous()
+        src_emb    = model.in_emb.weight.detach().cpu()
+        dst_emb    = model.out_emb.weight.detach().cpu()
+        merged_emb = ((src_emb + dst_emb) / 2.0).contiguous()
 
-    torch.save(
-        {
-            "src_embeddings": src_embeddings,
-            "dst_embeddings": dst_embeddings,
-            "embeddings": merged_embeddings,
-            "node_id_to_idx": node_id_to_idx,
-            "num_nodes": int(merged_embeddings.size(0)),
-            "dim": int(merged_embeddings.size(1)),
-            "best_threshold": best_metrics.get("threshold", 0.5),
-            "metrics": best_metrics,
-        },
-        path,
-    )
+    torch.save({
+        "src_embeddings":  src_emb,
+        "dst_embeddings":  dst_emb,
+        "embeddings":      merged_emb,
+        "node_id_to_idx":  node_id_to_idx,
+        "num_nodes":       int(merged_emb.size(0)),
+        "dim":             int(merged_emb.size(1)),
+        "best_threshold":  best_metrics.get("threshold", 0.5),
+        "metrics":         best_metrics,
+    }, path)
 
 
 # ---------------------------------------------------------------------------
@@ -462,19 +437,19 @@ def generate_embeddings(
     window_size: int = 5,
     num_walks_per_node: int = 5,
     num_negative_samples: int = 10,
-    batch_nodes: int = 8192,
-    skipgram_batch_size: int = 131072,
-    lr: float = 0.005,
+    batch_nodes: int = 4096,
+    skipgram_batch_size: int = 65536,
+    lr: float = 0.01,
     num_epochs: int = 10,
     val_ratio: float = 0.05,
     seed: int = 42,
     log_every_steps: int = 10,
-    val_every_steps: int = 50,
-    save_every_steps: int = 100,
+    val_every_steps: int = 100,
+    save_every_steps: int = 500,
     checkpoint_dir: str = "model/deepwalk",
     checkpoint_name: str = "checkpoint_latest.pt",
     final_embeddings_path: str = "model/deepwalk_node_embeddings.pt",
-    resume_from: str = None,
+    resume_from: str = "model/deepwalk/dw_checkpoint_v2_s800.pt",
 ):
     config = DeepWalkConfig(
         embedding_dim=embedding_dim,
@@ -496,6 +471,27 @@ def generate_embeddings(
         final_embeddings_path=final_embeddings_path,
     )
 
+    # -----------------------------------------------------------------------
+    # GPU setup
+    # -----------------------------------------------------------------------
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA not available. On RunPod, ensure you selected a GPU instance.\n"
+            "Check: python -c \"import torch; print(torch.cuda.is_available())\""
+        )
+
+    device = torch.device("cuda")
+    gpu_name   = torch.cuda.get_device_name(0)
+    gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    print(f"GPU: {gpu_name} ({gpu_mem_gb:.1f} GB VRAM)")
+    print("Embedding tables + optimizer state reside in CPU RAM (not VRAM).")
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # -----------------------------------------------------------------------
+    # Data loading
+    # -----------------------------------------------------------------------
     print("Reading graph...")
     adj = read_graph()
     edges, node_id_to_idx = build_edge_list_and_mapping(adj)
@@ -506,10 +502,10 @@ def generate_embeddings(
     num_edges = len(edges)
     print(f"Total nodes: {num_nodes}, Total edges (directed): {num_edges}")
 
-    train_edges, val_pos_edges = split_train_val_edges(edges, val_ratio=config.val_ratio, seed=config.seed)
+    train_edges, val_pos_edges = split_train_val_edges(
+        edges, val_ratio=config.val_ratio, seed=config.seed
+    )
 
-    # Integer-encoded edge set: much more memory-efficient than a set of tuples
-    # for 24M edges (~768 MB as ints vs ~3 GB as tuples).
     print("Building edge set for negative sampling...")
     edge_set_encoded = set((edges[:, 0] * num_nodes + edges[:, 1]).tolist())
     val_neg_edges = sample_negative_edges(
@@ -518,50 +514,61 @@ def generate_embeddings(
         edge_set_encoded=edge_set_encoded,
         seed=config.seed + 1,
     )
-    del edge_set_encoded  # free memory after use
+    del edge_set_encoded
 
-    # Use bidirectional adjacency for walks so sink nodes (out-degree=0)
-    # can participate.  This is the standard approach for DeepWalk on
-    # directed graphs: walk undirectedly, score directionally.
     print("Building CSR adjacency for vectorized walks...")
     walk_indptr, walk_indices, walk_degree = build_csr_bidirectional(num_nodes, train_edges)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    print(
-        f"Train edges: {len(train_edges)}, Val pos: {len(val_pos_edges)}, Val neg: {len(val_neg_edges)}"
-    )
+    print(f"Train edges: {len(train_edges)} | "
+          f"Val pos: {len(val_pos_edges)} | Val neg: {len(val_neg_edges)}")
 
-    model = DirectedDeepWalkModel(num_nodes=num_nodes, dim=config.embedding_dim).to(device)
-    # SparseAdam: only updates momentum/variance for rows with nonzero
-    # gradients — critical for 4.87M-node embedding tables.
+    # -----------------------------------------------------------------------
+    # Model + optimizer
+    # -----------------------------------------------------------------------
+    # Model stays on CPU — do NOT call .to(device).
+    # Only per-batch embedding lookup results are moved to GPU.
+    model = DirectedDeepWalkModel(num_nodes=num_nodes, dim=config.embedding_dim)
+
+    # SparseAdam operates on CPU sparse gradients. Moment tensors are
+    # allocated lazily in CPU RAM on the first optimizer.step() call.
     optimizer = torch.optim.SparseAdam(model.parameters(), lr=config.lr)
+
+    # After model init, VRAM should be near-zero (only CUDA context ~500 MB).
+    allocated = torch.cuda.memory_allocated(0) / 1024 ** 3
+    print(f"GPU memory after model init: {allocated:.3f} GB / {gpu_mem_gb:.1f} GB  "
+          f"(embeddings are in CPU RAM)")
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     ckpt_path = os.path.join(config.checkpoint_dir, config.checkpoint_name)
-    log_path = "logs/deepwalk_training.log"
+    log_path  = "logs/deepwalk_training.log"
 
-    start_epoch = 1
-    global_step = 0
+    start_epoch  = 1
+    global_step  = 0
     best_metrics = {"auc": 0.0, "ap": 0.0, "f1": 0.0, "threshold": 0.5, "step": 0, "epoch": 0}
 
     if resume_from and os.path.isfile(resume_from):
         print(f"Resuming from checkpoint: {resume_from}")
-        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        # Load onto CPU — model lives on CPU.
+        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        global_step = int(ckpt.get("step", 0))
+        start_epoch  = int(ckpt.get("epoch", 0)) + 1
+        global_step  = int(ckpt.get("step", 0))
         best_metrics = ckpt.get("best_metrics", best_metrics)
         print(f"Resumed at epoch={start_epoch}, step={global_step}")
 
     rng = np.random.default_rng(config.seed)
 
+    # -----------------------------------------------------------------------
+    # Training loop
+    # -----------------------------------------------------------------------
     with open(log_path, "a") as log_f:
         log_f.write(
-            f"# DeepWalk directed | nodes={num_nodes} edges(train)={len(train_edges)} dim={config.embedding_dim} "
-            f"walk={config.walk_length} window={config.window_size} walks/node={config.num_walks_per_node}\n"
+            f"# DeepWalk directed | gpu={gpu_name} | nodes={num_nodes} "
+            f"edges(train)={len(train_edges)} dim={config.embedding_dim} "
+            f"walk={config.walk_length} window={config.window_size} "
+            f"walks/node={config.num_walks_per_node} [CPU embeddings]\n"
         )
 
         all_train_nodes = np.arange(num_nodes, dtype=np.int64)
@@ -572,6 +579,8 @@ def generate_embeddings(
 
             for start in range(0, num_nodes, config.batch_nodes):
                 batch_source_nodes = all_train_nodes[start:start + config.batch_nodes]
+
+                # Walk generation on CPU — graph CSR lives in CPU RAM.
                 walks = generate_walks_vectorized(
                     source_nodes=batch_source_nodes,
                     indptr=walk_indptr,
@@ -587,8 +596,13 @@ def generate_embeddings(
                     window_size=config.window_size,
                     device=device,
                 )
+                del walks  # free CPU walk array immediately
 
                 if centers is None or contexts is None or centers.numel() == 0:
+                    if centers is not None:
+                        del centers
+                    if contexts is not None:
+                        del contexts
                     continue
 
                 loss = train_skipgram_batch(
@@ -598,16 +612,23 @@ def generate_embeddings(
                     contexts=contexts,
                     num_nodes=num_nodes,
                     num_negative_samples=config.num_negative_samples,
+                    gpu_device=device,
                     skipgram_batch_size=config.skipgram_batch_size,
                 )
+
+                del centers, contexts
+                torch.cuda.empty_cache()
 
                 global_step += 1
                 epoch_losses.append(loss)
 
                 if global_step % config.log_every_steps == 0:
+                    gpu_used     = torch.cuda.memory_allocated(0) / 1024 ** 3
+                    gpu_reserved = torch.cuda.memory_reserved(0) / 1024 ** 3
                     msg = (
                         f"Epoch {epoch}/{config.num_epochs} | Step {global_step} | "
-                        f"Loss: {loss:.4f} | Pairs: {centers.size(0)}"
+                        f"Loss: {loss:.4f} | "
+                        f"GPU mem: {gpu_used:.2f}/{gpu_reserved:.2f} GB"
                     )
                     print(msg)
                     log_f.write(msg + "\n")
@@ -619,7 +640,7 @@ def generate_embeddings(
                         val_neg_edges=val_neg_edges,
                         device=device,
                     )
-                    metrics["step"] = global_step
+                    metrics["step"]  = global_step
                     metrics["epoch"] = epoch
 
                     if metrics["f1"] >= best_metrics["f1"]:
@@ -650,47 +671,47 @@ def generate_embeddings(
 
             if epoch_losses:
                 mean_loss = float(np.mean(epoch_losses))
-                msg = f"Epoch {epoch} completed | Mean loss: {mean_loss:.4f}"
+                gpu_used  = torch.cuda.memory_allocated(0) / 1024 ** 3
+                msg = (f"Epoch {epoch} completed | Mean loss: {mean_loss:.4f} | "
+                       f"GPU mem: {gpu_used:.2f} GB")
                 print(msg)
                 log_f.write(msg + "\n")
                 log_f.flush()
-            
+
+            # Linear LR decay per epoch.
             new_lr = config.lr * (1 - (epoch - 1) / config.num_epochs)
             for g in optimizer.param_groups:
-                g['lr'] = max(new_lr, 3e-4)
+                g["lr"] = max(new_lr, 3e-4)
 
+    # -----------------------------------------------------------------------
+    # Final evaluation + save
+    # -----------------------------------------------------------------------
     print("Training completed. Running final validation...")
     final_metrics = evaluate_link_prediction(model, val_pos_edges, val_neg_edges, device)
-    final_metrics["step"] = global_step
+    final_metrics["step"]  = global_step
     final_metrics["epoch"] = config.num_epochs
 
     if final_metrics["f1"] >= best_metrics["f1"]:
         best_metrics = final_metrics
 
     print(
-        f"Final metrics | AUC: {final_metrics['auc']:.4f} | AP: {final_metrics['ap']:.4f} | "
-        f"F1: {final_metrics['f1']:.4f} | Threshold: {final_metrics['threshold']:.2f}"
+        f"Final metrics | AUC: {final_metrics['auc']:.4f} | "
+        f"AP: {final_metrics['ap']:.4f} | F1: {final_metrics['f1']:.4f} | "
+        f"Threshold: {final_metrics['threshold']:.2f}"
     )
 
     save_checkpoint(
-        path=ckpt_path,
-        model=model,
-        optimizer=optimizer,
-        epoch=config.num_epochs,
-        step=global_step,
-        best_metrics=best_metrics,
-        node_id_to_idx=node_id_to_idx,
-        config=config,
+        path=ckpt_path, model=model, optimizer=optimizer,
+        epoch=config.num_epochs, step=global_step,
+        best_metrics=best_metrics, node_id_to_idx=node_id_to_idx, config=config,
     )
     save_final_embeddings(
-        path=config.final_embeddings_path,
-        model=model,
-        node_id_to_idx=node_id_to_idx,
-        best_metrics=best_metrics,
+        path=config.final_embeddings_path, model=model,
+        node_id_to_idx=node_id_to_idx, best_metrics=best_metrics,
     )
 
     print(f"Saved final checkpoint: {ckpt_path}")
-    print(f"Saved final embeddings: {config.final_embeddings_path}")
+    print(f"Saved final embeddings:  {config.final_embeddings_path}")
     print(f"Best validation metrics: {best_metrics}")
 
 
