@@ -1,13 +1,13 @@
 """
 Graph utilities: loading, edge splitting, and negative sampling.
 """
+import csv
 import logging
 import random
 from typing import List, Set, Tuple
 
 import networkx as nx
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -15,57 +15,132 @@ logger = logging.getLogger(__name__)
 
 # ── Graph Loading ──────────────────────────────────────────────────────────────
 
+def _is_header_cell(value: str) -> bool:
+    """
+    Return True if *value* looks like a column label rather than a node ID.
+    A cell is treated as a header if it is non-empty and cannot be parsed
+    as an integer or float.
+    """
+    stripped = value.strip()
+    if not stripped:
+        return False
+    try:
+        float(stripped)
+        return False
+    except ValueError:
+        return True
+
+
 def load_graph_from_adjacency_csv(filepath: str, directed: bool = True) -> nx.DiGraph:
     """
-    Load a directed (or undirected) graph from an adjacency-list CSV.
+    Load a directed (or undirected) graph from a *ragged* adjacency-list CSV.
 
-    Expected CSV format — header is optional and auto-detected:
-        node_id, neighbor_1, neighbor_2, neighbor_3, ...
+    Each row has a variable number of columns:
+        source_node, neighbor_1, neighbor_2, ..., neighbor_N
 
-    The first column is the source node; every subsequent non-NaN value is
-    an out-neighbour of that source.
+    Rows are read one at a time with the built-in ``csv`` module so the file
+    is never fully loaded into memory — no NaN-padded DataFrame, no up-front
+    column-count scan.  This is safe and efficient for graphs with tens of
+    millions of edges and highly variable degree distributions.
+
+    Format rules
+    ------------
+    - The first column of every data row is the source node ID (integer).
+    - All subsequent non-empty fields on that row are out-neighbour IDs.
+    - A header row is auto-detected: if the first cell of the first row
+      cannot be parsed as a number it is skipped.
+    - Empty fields within a row (e.g. trailing commas) are silently ignored.
+    - Rows whose source cell is missing or non-numeric are skipped and
+      counted so you can spot malformed input early.
 
     Parameters
     ----------
-    filepath : path to the adjacency-list CSV file
-    directed : if True, builds a DiGraph; otherwise an undirected Graph
+    filepath : str
+        Path to the adjacency-list CSV file.
+    directed : bool
+        If True (default) builds a ``DiGraph``; otherwise an undirected ``Graph``.
 
     Returns
     -------
-    NetworkX DiGraph (or Graph)
+    nx.DiGraph or nx.Graph
     """
     logger.info(f"Loading graph from '{filepath}' ...")
 
-    # Auto-detect whether the first row is a header
-    peek = pd.read_csv(filepath, header=None, nrows=1)
-    first_cell = str(peek.iloc[0, 0]).strip().lower()
-    has_header = not first_cell.lstrip("-").replace(".", "", 1).isdigit()
+    G: nx.Graph = nx.DiGraph() if directed else nx.Graph()
 
-    df = pd.read_csv(filepath, header=0 if has_header else None, low_memory=False)
+    skipped_rows     = 0   # rows whose source cell is absent or non-numeric
+    skipped_neighbor = 0   # individual neighbor cells that could not be parsed
+    total_rows       = 0
 
-    G = nx.DiGraph() if directed else nx.Graph()
-    skipped_rows = 0
+    with open(filepath, newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Building graph", unit="rows"):
-        src_raw = row.iloc[0]
-        if pd.isna(src_raw):
-            skipped_rows += 1
-            continue
-        src = int(src_raw)
-        G.add_node(src)
-        for val in row.iloc[1:]:
-            if pd.notna(val):
+        # ── Header detection ──────────────────────────────────────────────────
+        # Peek at the first row; put it back if it contains data.
+        try:
+            first_row = next(reader)
+        except StopIteration:
+            logger.warning("CSV file is empty — returning empty graph.")
+            return G
+
+        if first_row and _is_header_cell(first_row[0]):
+            logger.info(f"Header row detected and skipped: {first_row}")
+        else:
+            # Not a header — process it as a data row
+            reader = _prepend_row(first_row, reader)  # type: ignore[assignment]
+
+        # ── Row-by-row streaming parse ────────────────────────────────────────
+        for row in tqdm(reader, desc="Building graph", unit="rows", mininterval=2.0):
+            total_rows += 1
+
+            if not row:          # completely blank line
+                skipped_rows += 1
+                continue
+
+            src_cell = row[0].strip()
+            if not src_cell:     # source field is empty
+                skipped_rows += 1
+                continue
+
+            try:
+                src = int(src_cell)
+            except ValueError:
+                logger.debug(f"Row {total_rows}: cannot parse source '{src_cell}' — skipped.")
+                skipped_rows += 1
+                continue
+
+            G.add_node(src)
+
+            # Every field after the first is a potential neighbour
+            for cell in row[1:]:
+                cell = cell.strip()
+                if not cell:     # empty field (e.g. trailing comma)
+                    continue
                 try:
-                    G.add_edge(src, int(val))
-                except (ValueError, TypeError):
-                    pass  # ignore non-numeric neighbour cells
+                    G.add_edge(src, int(cell))
+                except ValueError:
+                    logger.debug(
+                        f"Row {total_rows}: cannot parse neighbour '{cell}' "
+                        f"for source {src} — skipped."
+                    )
+                    skipped_neighbor += 1
 
     logger.info(
         f"Graph loaded  →  {G.number_of_nodes():,} nodes, "
-        f"{G.number_of_edges():,} edges  "
-        f"(skipped {skipped_rows} malformed rows)"
+        f"{G.number_of_edges():,} edges  |  "
+        f"rows processed: {total_rows:,}  |  "
+        f"skipped rows: {skipped_rows:,}  |  "
+        f"skipped neighbour cells: {skipped_neighbor:,}"
     )
     return G
+
+
+# ── Internal helper ────────────────────────────────────────────────────────────
+
+def _prepend_row(row, iterator):
+    """Yield *row* first, then yield everything from *iterator*."""
+    yield row
+    yield from iterator
 
 
 # ── Edge Splitting ─────────────────────────────────────────────────────────────
