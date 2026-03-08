@@ -19,10 +19,14 @@ torch.set_num_threads(os.cpu_count())
 @dataclass
 class DeepWalkConfig:
     # --- Embedding ---
-    # 256 vs 128: A100 has 80 GB VRAM — two 4.87M×256 tables cost ~10 GB
-    # (fp32), well within budget. Richer embeddings improve link prediction
-    # quality with no runtime penalty on A100's 2 TB/s HBM2e.
-    embedding_dim: int = 256
+    # VRAM budget (4.87M nodes, fp32):
+    #   weights:       2 × 4.87M × 128 × 4B =  5.0 GB
+    #   SparseAdam m1: 2 × 4.87M × 128 × 4B =  5.0 GB
+    #   SparseAdam m2: 2 × 4.87M × 128 × 4B =  5.0 GB
+    #   peak batch:    524288 × 10 × 128 × 4B = 2.7 GB
+    #   total:                                ~17.7 GB ✓
+    # dim=256 tripled static footprint to ~30 GB via SparseAdam moments → OOM.
+    embedding_dim: int = 128
 
     # --- Walk hyperparameters ---
     # walk_length=40: longer context captures higher-order neighborhoods.
@@ -37,10 +41,9 @@ class DeepWalkConfig:
     # Each node batch of 16 384 launches 163 840 walkers — still fast
     # with vectorized numpy walks on a 48-core RunPod CPU.
     num_walks_per_node: int = 10
-    # num_negative_samples=15: more negatives sharpen the decision boundary.
-    # Memory cost: (skipgram_batch_size × 15 × 256) ≈ 1.6 GB peak — fine
-    # on 80 GB VRAM.
-    num_negative_samples: int = 15
+    # num_negative_samples=10: peak neg tensor = 524288 × 10 × 128 × 4B = 2.7 GB
+    # Was 15 with dim=256 → 524288 × 15 × 256 × 4B = 32 GB → OOM.
+    num_negative_samples: int = 10
 
     # --- Batch sizes ---
     # batch_nodes=16384: 2x larger node batch per walk round.
@@ -392,11 +395,11 @@ def save_final_embeddings(path, model, node_id_to_idx, best_metrics):
 # ---------------------------------------------------------------------------
 
 def generate_embeddings(
-    embedding_dim: int = 256,
+    embedding_dim: int = 128,
     walk_length: int = 40,
     window_size: int = 10,
     num_walks_per_node: int = 10,
-    num_negative_samples: int = 15,
+    num_negative_samples: int = 10,
     batch_nodes: int = 16384,
     skipgram_batch_size: int = 524288,
     lr: float = 0.01,
