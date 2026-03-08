@@ -18,8 +18,8 @@ NODE2VEC_CONFIG = {
     "dimensions":  128,   # embedding size — 64 is the sweet spot for LR
     "walk_length": 20,    # steps per random walk
     "num_walks":   10,    # walks per node — keep low for speed
-    "p":           1.0,   # return parameter  (1 = neutral BFS/DFS)
-    "q":           1.0,   # in-out parameter  (1 = neutral)
+    "p":           2.0,   # return parameter  (1 = neutral BFS/DFS)
+    "q":           0.75,  # in-out parameter  (1 = neutral)
     "workers":     4,     # parallel workers for walk generation
 }
 
@@ -46,7 +46,7 @@ FEATURE_OPERATOR = "hadamard"
 
 # ── Logistic Regression ───────────────────────────────────────────────────────
 LR_CONFIG = {
-    "C":            1.0,
+    "C":            0.9,
     "max_iter":     1000,
     "solver":       "lbfgs",
     "class_weight": "balanced",   # handles any residual class imbalance
