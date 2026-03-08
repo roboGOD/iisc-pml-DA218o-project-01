@@ -1,5 +1,11 @@
 import csv
 import os
+
+# Must be set before any CUDA ops to reduce allocator fragmentation.
+# expandable_segments lets PyTorch grow existing segments rather than
+# allocating new ones, preventing the "reserved but unallocated" OOM.
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -23,42 +29,25 @@ class DeepWalkConfig:
     #   weights:       2 × 4.87M × 128 × 4B =  5.0 GB
     #   SparseAdam m1: 2 × 4.87M × 128 × 4B =  5.0 GB
     #   SparseAdam m2: 2 × 4.87M × 128 × 4B =  5.0 GB
-    #   peak batch:    524288 × 10 × 128 × 4B = 2.7 GB
-    #   total:                                ~17.7 GB ✓
+    #   peak batch:    65536 × 10 × 128 × 4B = 0.33 GB
+    #   total:                                ~15.3 GB ✓
     # dim=256 tripled static footprint to ~30 GB via SparseAdam moments → OOM.
     embedding_dim: int = 128
 
     # --- Walk hyperparameters ---
-    # walk_length=40: longer context captures higher-order neighborhoods.
-    # Doubled from 20 — CPU walk gen is the bottleneck, not GPU, so the
-    # extra pairs are "free" from a GPU utilization standpoint.
     walk_length: int = 40
-    # window_size=10: wider context window pairs with the longer walk.
-    # Pairs scale as O(walk_length × window_size), so GPU batch sizes
-    # below absorb the ~4x increase comfortably.
     window_size: int = 10
-    # num_walks_per_node=10: 2x more walks → denser training signal.
-    # Each node batch of 16 384 launches 163 840 walkers — still fast
-    # with vectorized numpy walks on a 48-core RunPod CPU.
     num_walks_per_node: int = 10
-    # num_negative_samples=10: peak neg tensor = 524288 × 10 × 128 × 4B = 2.7 GB
-    # Was 15 with dim=256 → 524288 × 15 × 256 × 4B = 32 GB → OOM.
     num_negative_samples: int = 10
 
     # --- Batch sizes ---
-    # batch_nodes=16384: 2x larger node batch per walk round.
-    # Produces more (center, context) pairs per GPU step, improving
-    # GPU occupancy and amortizing CPU→GPU transfer overhead.
     batch_nodes: int = 8192
-    # skipgram_batch_size=524288 (512K): 4x larger than before.
-    # A100 SXM has 80 GB VRAM and 2 TB/s bandwidth — the bottleneck
-    # is arithmetic throughput, not memory. Larger sub-batches reduce
-    # kernel-launch overhead and improve SM utilization.
-    skipgram_batch_size: int = 131072
+    # Halved from 131072 → cuts peak sub-batch allocation from ~17 GB to ~8.5 GB.
+    # center_vec: 65536 × 1   × 128 × 4B = 32 MB
+    # neg_vec:    65536 × 10  × 128 × 4B = 320 MB  ← safe
+    skipgram_batch_size: int = 65536
 
     # --- Optimizer ---
-    # lr=0.01: scale lr with effective batch size (linear scaling rule).
-    # batch_nodes×num_walks×pairs/walk is ~4x larger → lr ×2 is conservative.
     lr: float = 0.01
     num_epochs: int = 10
     val_ratio: float = 0.05
@@ -78,7 +67,6 @@ class DirectedDeepWalkModel(nn.Module):
         super().__init__()
         # sparse=True enables SparseAdam and avoids dense gradient allocation.
         # NOTE: sparse embeddings on CUDA require SparseAdam (not Adam).
-        # On GPU, sparse embedding lookups are handled natively by CUDA.
         self.in_emb = nn.Embedding(num_nodes, dim, sparse=True)
         self.out_emb = nn.Embedding(num_nodes, dim, sparse=True)
         init_range = 0.5
@@ -194,7 +182,7 @@ def generate_walks_vectorized(
     degree: np.ndarray, walk_length: int, num_walks: int, rng,
 ) -> np.ndarray:
     """Generate random walks for all source nodes in parallel using numpy.
-    
+
     Walk generation runs on CPU (numpy) — the graph structure lives in
     CPU RAM and would require costly GPU transfers per step. The resulting
     (center, context) pairs are then transferred to GPU for training.
@@ -231,9 +219,14 @@ def generate_walks_vectorized(
 
 def build_context_pairs_vectorized(walks: np.ndarray, window_size: int, device):
     """Build (center, context) pairs from a 2D walk array.
-    
+
     Pairs are assembled on CPU (numpy) then transferred to GPU in one
-    contiguous block — much faster than incremental GPU tensor ops.
+    contiguous block.
+
+    NOTE: pin_memory() removed — pinned memory persists in the CUDA
+    allocator's pool and worsens fragmentation when tensors are large.
+    Direct .to(device) is slightly slower per transfer but produces far
+    less allocator pressure across thousands of batches.
     """
     walk_length = walks.shape[1]
     center_parts = []
@@ -252,13 +245,18 @@ def build_context_pairs_vectorized(walks: np.ndarray, window_size: int, device):
     centers_np = np.concatenate(center_parts)
     contexts_np = np.concatenate(context_parts)
 
+    # Free CPU list memory before GPU transfer — these can be hundreds of MB.
+    del center_parts, context_parts
+
     if len(centers_np) == 0:
         return None, None
 
-    # pin_memory=True + non_blocking=True: overlap CPU→GPU transfer with
-    # the next batch's walk generation for higher GPU utilization.
-    centers = torch.from_numpy(centers_np).pin_memory().to(device, non_blocking=True)
-    contexts = torch.from_numpy(contexts_np).pin_memory().to(device, non_blocking=True)
+    centers = torch.from_numpy(centers_np).to(device)
+    contexts = torch.from_numpy(contexts_np).to(device)
+
+    # Free numpy arrays immediately after GPU transfer.
+    del centers_np, contexts_np
+
     return centers, contexts
 
 
@@ -267,10 +265,10 @@ def train_skipgram_batch(
     num_negative_samples: int, skipgram_batch_size: int = 65536,
 ):
     """Train one skip-gram step with gradient-accumulating sub-batches.
-    
+
     Sub-batching keeps peak GPU memory proportional to skipgram_batch_size.
-    On a 24GB GPU (A100/A10), skipgram_batch_size=131072 is safe with
-    dim=128 and num_negative_samples=10.
+    Intermediate tensors are explicitly deleted after each sub-batch to
+    return memory to the CUDA allocator before the next allocation.
     """
     optimizer.zero_grad()
     total_loss = 0.0
@@ -288,8 +286,8 @@ def train_skipgram_batch(
             size=(c.size(0), num_negative_samples),
             device=c.device,
         )
-        center_vec = model.in_emb(c).unsqueeze(1)
-        neg_vec = model.out_emb(neg_nodes)
+        center_vec = model.in_emb(c).unsqueeze(1)   # [B, 1, dim]
+        neg_vec = model.out_emb(neg_nodes)           # [B, neg, dim]
         neg_logits = (center_vec * neg_vec).sum(dim=-1)
         neg_loss = F.logsigmoid(-neg_logits).sum(dim=1)
 
@@ -297,7 +295,20 @@ def train_skipgram_batch(
         sub_loss.backward()
         total_loss += float(sub_loss.item())
 
+        # Explicitly free all sub-batch intermediates before the next
+        # iteration allocates center_vec/neg_vec again. Without this,
+        # PyTorch holds onto freed blocks in its cache and the allocator
+        # sees artificially high "in use" memory → OOM on next alloc.
+        del c, ctx, pos_logits, pos_loss, neg_nodes
+        del center_vec, neg_vec, neg_logits, neg_loss, sub_loss
+
     optimizer.step()
+
+    # Return freed blocks to the allocator pool between node batches.
+    # empty_cache() does not free active tensors — it only consolidates
+    # the cache so future large allocations can find contiguous space.
+    torch.cuda.empty_cache()
+
     return total_loss
 
 
@@ -401,7 +412,7 @@ def generate_embeddings(
     num_walks_per_node: int = 10,
     num_negative_samples: int = 10,
     batch_nodes: int = 8192,
-    skipgram_batch_size: int = 131072,
+    skipgram_batch_size: int = 65536,
     lr: float = 0.01,
     num_epochs: int = 10,
     val_ratio: float = 0.05,
@@ -450,8 +461,6 @@ def generate_embeddings(
     print(f"GPU: {gpu_name} ({gpu_mem_gb:.1f} GB VRAM)")
 
     # TF32 is enabled by default on Ampere (A100, A10, RTX 3090+).
-    # Explicitly confirm it's on for matmuls — gives ~2x throughput vs FP32
-    # on supported GPUs with negligible accuracy loss for embeddings.
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -492,12 +501,8 @@ def generate_embeddings(
     model = DirectedDeepWalkModel(num_nodes=num_nodes, dim=config.embedding_dim).to(device)
 
     # SparseAdam: required for sparse=True embeddings on both CPU and GPU.
-    # On CUDA, sparse embedding gradients are coalesced before the Adam update,
-    # so only rows touched in the forward pass are updated — memory-efficient
-    # for 4M+ node tables.
     optimizer = torch.optim.SparseAdam(model.parameters(), lr=config.lr)
 
-    # Print GPU memory after model allocation
     allocated = torch.cuda.memory_allocated(0) / 1024 ** 3
     print(f"GPU memory after model init: {allocated:.2f} GB / {gpu_mem_gb:.1f} GB")
 
@@ -512,8 +517,6 @@ def generate_embeddings(
 
     if resume_from and os.path.isfile(resume_from):
         print(f"Resuming from checkpoint: {resume_from}")
-        # map_location=device ensures tensors load directly onto GPU
-        # without a CPU→GPU copy step.
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -554,12 +557,16 @@ def generate_embeddings(
                     rng=rng,
                 )
 
-                # Pairs assembled on CPU, then pinned+transferred to GPU.
+                # Pairs assembled on CPU, then transferred to GPU.
                 centers, contexts = build_context_pairs_vectorized(
                     walks=walks,
                     window_size=config.window_size,
                     device=device,
                 )
+
+                # Free walk array immediately — can be hundreds of MB for
+                # large batch_nodes × num_walks_per_node × walk_length.
+                del walks
 
                 if centers is None or contexts is None or centers.numel() == 0:
                     continue
@@ -574,16 +581,21 @@ def generate_embeddings(
                     skipgram_batch_size=config.skipgram_batch_size,
                 )
 
+                # Free GPU pair tensors immediately after the training step.
+                # Holding them until the variable is overwritten next iteration
+                # means both the old and new pair tensors exist simultaneously.
+                del centers, contexts
+                torch.cuda.empty_cache()
+
                 global_step += 1
                 epoch_losses.append(loss)
 
                 if global_step % config.log_every_steps == 0:
-                    # Report GPU memory utilization alongside loss.
                     gpu_used = torch.cuda.memory_allocated(0) / 1024 ** 3
                     gpu_reserved = torch.cuda.memory_reserved(0) / 1024 ** 3
                     msg = (
                         f"Epoch {epoch}/{config.num_epochs} | Step {global_step} | "
-                        f"Loss: {loss:.4f} | Pairs: {centers.size(0)} | "
+                        f"Loss: {loss:.4f} | "
                         f"GPU mem: {gpu_used:.2f}/{gpu_reserved:.2f} GB"
                     )
                     print(msg)
