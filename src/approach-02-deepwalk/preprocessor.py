@@ -48,7 +48,7 @@ class DeepWalkConfig:
     skipgram_batch_size: int = 65536
 
     # --- Optimizer ---
-    lr: float = 0.01
+    lr: float = 0.005
     num_epochs: int = 10
     val_ratio: float = 0.05
     seed: int = 42
@@ -413,7 +413,7 @@ def generate_embeddings(
     num_negative_samples: int = 10,
     batch_nodes: int = 8192,
     skipgram_batch_size: int = 65536,
-    lr: float = 0.01,
+    lr: float = 0.005,
     num_epochs: int = 10,
     val_ratio: float = 0.05,
     seed: int = 42,
