@@ -272,6 +272,7 @@ class Node2VecLinkPredictor:
             operators=self.feature_operators,
             pagerank=pagerank,
         )
+
         logger.info(
             f"Training set  →  "
             f"{y_train.sum():,} positives  |  "
