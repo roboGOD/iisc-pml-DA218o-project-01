@@ -351,7 +351,7 @@ GRAPH_FEATURE_DIM = 20   # number of structural features (was 11, now 20)
 
 # ── Memory-safe allocation ─────────────────────────────────────────────────────
 
-_MEMMAP_THRESHOLD_BYTES = 8 * 1024**3  # 8 GB — safe headroom on a 48 GB machine
+_MEMMAP_THRESHOLD_BYTES = 4 * 1024**3  # 4 GB — safe headroom on a 48 GB machine
 
 
 def _allocate_array(shape, dtype=np.float32):

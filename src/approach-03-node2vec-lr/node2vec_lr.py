@@ -417,7 +417,6 @@ class Node2VecLinkPredictor:
             G=G_train if self.use_graph_features else None,
             operators=self.feature_operators,
             pagerank=pagerank,
-            operators=self.feature_operators,
         )
         y_pred  = self.classifier.predict(X)
         y_proba = self.classifier.predict_proba(X)[:, 1]

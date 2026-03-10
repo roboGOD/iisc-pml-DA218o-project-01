@@ -24,7 +24,7 @@ GRAPH_CONFIG = {
 #
 NODE2VEC_CONFIG = {
     "mode":        "SparseOTF",  # change to DenseOTF if you have 32 GB+ RAM
-    "dimensions":  256,   # doubled from 128 → richer representations for 5M nodes
+    "dimensions":  128,   # doubled from 128 → richer representations for 5M nodes
     "walk_length": 40,    # doubled from 20 → deeper structural capture
     "num_walks":   20,    # doubled from 10 → better coverage of sparse regions
     "p":           1.0,   # unbiased return (was 2.0 — too aggressive backtrack penalty)
