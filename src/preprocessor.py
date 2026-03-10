@@ -246,6 +246,7 @@ def generate_embeddings(
     start_step = 1
     best_threshold = 0.5
     best_metrics = {}
+    prev_ckpt_path = None  # track last checkpoint to delete after saving new one
     
     torch.set_num_threads(os.cpu_count())
 
@@ -311,6 +312,12 @@ def generate_embeddings(
                 print(f"  [CKPT] Saved checkpoint → {ckpt_path}")
                 log_f.write(f"  [CKPT] Saved → {ckpt_path}\n")
                 log_f.flush()
+                # Delete previous checkpoint to free disk space
+                if prev_ckpt_path and os.path.isfile(prev_ckpt_path):
+                    os.remove(prev_ckpt_path)
+                    print(f"  [CKPT] Deleted old checkpoint: {prev_ckpt_path}")
+                    log_f.write(f"  [CKPT] Deleted old checkpoint: {prev_ckpt_path}\n")
+                prev_ckpt_path = ckpt_path
 
     # --- Final save -----------------------------------------------------------
     print("Training completed. Saving final embeddings...")
