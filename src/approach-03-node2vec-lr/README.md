@@ -119,4 +119,4 @@ on disk-based sparse graphs.
 - **ROC-AUC** — primary ranking metric
 - **Average Precision** — area under the Precision-Recall curve
 - **F1 / Precision / Recall** — threshold-based metrics at 0.5
-- Full classification report printed and saved to `artifacts/training.log`
+- Full classification report printed and saved to `artifacts/node2vec/training.log`

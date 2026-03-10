@@ -1,15 +1,13 @@
 """
-Training entry-point for the Node2Vec + Logistic Regression link predictor.
-
-Supports checkpointing: every major stage (graph load, split, embeddings,
-classifier, evaluation) is persisted so training can be resumed from the
-last completed step with ``--resume``.
+End-to-end entry-point: train the Node2Vec + Logistic Regression model,
+then immediately run inference on the test set.
 
 Usage
 -----
-    python train.py --graph train_graph.csv
-    python train.py --graph train_graph.csv --seed 123
-    python train.py --resume              # resume from last checkpoint
+    python main.py
+    python main.py --graph data/raw/train.csv --seed 123
+    python main.py --resume
+    python main.py --output data/processed/my_predictions.csv --proba
 """
 import argparse
 import json
@@ -17,6 +15,9 @@ import logging
 import os
 import sys
 import time
+
+import networkx as nx
+import pandas as pd
 
 from checkpoint import CheckpointManager
 from config import (
@@ -78,7 +79,7 @@ ckpt = CheckpointManager(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Train Node2Vec + Logistic Regression for link prediction"
+        description="Train Node2Vec + LR, then predict on the test set"
     )
     p.add_argument(
         "--graph",
@@ -96,22 +97,39 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Resume training from the last checkpoint (if one exists)",
     )
+    p.add_argument(
+        "--test",
+        default=PATHS["test_edges"],
+        help="Path to test CSV with columns [Id, From, To] (default: %(default)s)",
+    )
+    p.add_argument(
+        "--output",
+        default=PATHS["predictions"],
+        help="Path for the output predictions CSV (default: %(default)s)",
+    )
+    p.add_argument(
+        "--proba",
+        action="store_true",
+        help="If set, also include an edge-probability column in the output",
+    )
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=0.9,
+        help="Probability threshold for classifying an edge as 1 (default: 0.9)",
+    )
     return p.parse_args()
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Training phase ─────────────────────────────────────────────────────────────
 
-def main() -> None:
-    args = parse_args()
-    t_start = time.time()
-
+def run_training(args) -> Node2VecLinkPredictor:
     logger.info("=" * 60)
-    logger.info("  Node2Vec + Logistic Regression — Link Prediction")
+    logger.info("  PHASE 1 — Training")
     logger.info("=" * 60)
     logger.info(f"Graph file : {args.graph}")
     logger.info(f"Random seed: {args.seed}")
 
-    # ── Attempt checkpoint resume ──────────────────────────────────────────────
     ckpt_stage, ckpt_data = (None, {})
     if args.resume:
         ckpt_stage, ckpt_data = ckpt.load()
@@ -157,8 +175,6 @@ def main() -> None:
             train_neg=train_neg, val_neg=val_neg, test_neg=test_neg,
         )
 
-    # G is no longer needed — G_train is used for all subsequent steps.
-    # The checkpoint file from split_done is retained on disk for resume.
     del G
     ckpt_data.pop("G", None)
 
@@ -174,43 +190,45 @@ def main() -> None:
         use_graph_features=USE_GRAPH_FEATURES,
     )
 
-    # ── 3a. Embeddings ─────────────────────────────────────────────────────────
     if ckpt.past_stage(ckpt_stage, "embeddings_done"):
         logger.info("[checkpoint] Skipping embedding training (already done).")
         predictor.wv   = ckpt_data["wv"]
         predictor._dim = NODE2VEC_CONFIG["dimensions"]
     else:
         predictor.fit_embeddings(G_train)
-        ckpt.save(
-            "embeddings_done",
-            wv=predictor.wv,
-        )
+        ckpt.save("embeddings_done", wv=predictor.wv)
 
-    # ── 3b. Classifier ────────────────────────────────────────────────────────
+    # ── Compute PageRank once (used by graph features) ──────────────────────
+    pagerank = None
+    if USE_GRAPH_FEATURES:
+        logger.info("Computing PageRank on G_train (one-time) ...")
+        pagerank = nx.pagerank(G_train, alpha=0.85, max_iter=50, tol=1e-4)
+        logger.info(f"PageRank computed for {len(pagerank):,} nodes.")
+
     if ckpt.past_stage(ckpt_stage, "classifier_done"):
         logger.info("[checkpoint] Skipping classifier training (already done).")
         predictor.classifier = ckpt_data["classifier"]
     else:
-        predictor.fit_classifier(train_pos, train_neg, G_train=G_train)
-        ckpt.save(
-            "classifier_done",
-            classifier=predictor.classifier,
+        predictor.fit_classifier(
+            train_pos, train_neg,
+            G_train=G_train,
+            pagerank=pagerank,
+            val_pos=val_pos,
+            val_neg=val_neg,
         )
+        ckpt.save("classifier_done", classifier=predictor.classifier)
 
-    # ── 4. Evaluate on validation and test sets ────────────────────────────────
+    # ── 4. Evaluate ────────────────────────────────────────────────────────────
     if ckpt.past_stage(ckpt_stage, "evaluation_done"):
         logger.info("[checkpoint] Skipping evaluation (already done).")
         val_metrics  = ckpt_data["val_metrics"]
         test_metrics = ckpt_data["test_metrics"]
     else:
-        val_metrics  = predictor.evaluate(val_pos,  val_neg,  split_name="val",  G_train=G_train)
-        test_metrics = predictor.evaluate(test_pos, test_neg, split_name="test", G_train=G_train)
-        ckpt.save(
-            "evaluation_done",
-            val_metrics=val_metrics, test_metrics=test_metrics,
-        )
+        val_metrics  = predictor.evaluate(val_pos,  val_neg,  split_name="val",  G_train=G_train, pagerank=pagerank)
+        test_metrics = predictor.evaluate(test_pos, test_neg, split_name="test", G_train=G_train, pagerank=pagerank)
+        ckpt.save("evaluation_done", val_metrics=val_metrics, test_metrics=test_metrics)
 
-    # ── 5. Persist final model and metrics ─────────────────────────────────────
+    # ── 5. Persist model and metrics ───────────────────────────────────────────
     if not ckpt.past_stage(ckpt_stage, "complete"):
         predictor.save(PATHS["embeddings"], PATHS["classifier"])
 
@@ -221,9 +239,75 @@ def main() -> None:
 
         ckpt.save("complete")
 
+    return predictor
+
+
+# ── Prediction phase ───────────────────────────────────────────────────────────
+
+def run_prediction(predictor: Node2VecLinkPredictor, args) -> None:
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("  PHASE 2 — Inference")
+    logger.info("=" * 60)
+
+    # Load G_train for structural features if needed
+    G_train = None
+    pagerank = None
+    if USE_GRAPH_FEATURES:
+        logger.info("Loading training graph for structural features ...")
+        G_train = load_graph_from_adjacency_csv(
+            args.graph, directed=GRAPH_CONFIG["directed"]
+        )
+        logger.info("Computing PageRank for inference ...")
+        pagerank = nx.pagerank(G_train, alpha=0.85, max_iter=50, tol=1e-4)
+
+    logger.info(f"Loading test edges from '{args.test}' ...")
+    df_test = pd.read_csv(args.test)
+
+    required_cols = {"Id", "From", "To"}
+    missing = required_cols - set(df_test.columns)
+    if missing:
+        raise ValueError(
+            f"Test CSV is missing required columns: {missing}. "
+            f"Found: {list(df_test.columns)}"
+        )
+
+    edges = list(zip(df_test["From"].tolist(), df_test["To"].tolist()))
+    logger.info(f"Predicting {len(edges):,} candidate edges ...")
+
+    logger.info(f"Using probability threshold: {args.threshold}")
+    probas = predictor.predict_proba(edges, G_train=G_train, pagerank=pagerank)
+    preds = (probas >= args.threshold).astype(int)
+
+    out = pd.DataFrame({"Id": df_test["Id"], "Predictions": preds.astype(int)})
+    if args.proba:
+        out["Probability"] = probas.round(4)
+        logger.info("Edge probabilities included in output (--proba flag set).")
+
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    out.to_csv(args.output, index=False)
+
+    n_edge    = int(preds.sum())
+    n_no_edge = int((preds == 0).sum())
+    logger.info(
+        f"Predictions saved → '{args.output}'  "
+        f"( edge=1: {n_edge:,}  |  no-edge=0: {n_no_edge:,} )"
+    )
+    logger.info("Inference complete.")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args = parse_args()
+    t_start = time.time()
+
+    predictor = run_training(args)
+    run_prediction(predictor, args)
+
     elapsed = time.time() - t_start
-    logger.info(f"\nTotal training time: {elapsed / 60:.1f} min  ({elapsed:.0f}s)")
-    logger.info("Training complete.")
+    logger.info(f"\nTotal elapsed time: {elapsed / 60:.1f} min  ({elapsed:.0f}s)")
+    logger.info("Done.")
 
 
 if __name__ == "__main__":

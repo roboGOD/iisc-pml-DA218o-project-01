@@ -363,9 +363,9 @@ def train_val_test_split(
     n_val_neg   = int(len(val_pos)   * neg_ratio)
     n_test_neg  = int(len(test_pos)  * neg_ratio)
 
-    train_neg = _sample_hard_negatives(n_train_neg)
-    val_neg   = _sample_hard_negatives(n_val_neg)
-    test_neg  = _sample_hard_negatives(n_test_neg)
+    train_neg = _sample_hard_negatives(n_train_neg, hard_ratio=0.5)
+    val_neg   = _sample_hard_negatives(n_val_neg,   hard_ratio=0.5)
+    test_neg  = _sample_hard_negatives(n_test_neg,  hard_ratio=0.5)
 
     logger.info(
         f"Negatives sampled  →  "

@@ -20,14 +20,20 @@ import logging
 import sys
 
 import pandas as pd
+import networkx as nx
 
 from config import (
+    CLASSIFIER_TYPE,
     FEATURE_OPERATOR,
+    FEATURE_OPERATORS,
+    GRAPH_CONFIG,
     LR_CONFIG,
     NODE2VEC_CONFIG,
     PATHS,
+    USE_GRAPH_FEATURES,
     W2V_CONFIG,
 )
+from graph_utils import load_graph_from_adjacency_csv
 from node2vec_lr import Node2VecLinkPredictor
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
@@ -59,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If set, also include an edge-probability column in the output",
     )
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=0.9,
+        help="Probability threshold for classifying an edge as 1 (default: 0.9)",
+    )
     return p.parse_args()
 
 
@@ -74,7 +86,23 @@ def main() -> None:
         w2v_config=W2V_CONFIG,
         lr_config=LR_CONFIG,
         feature_operator=FEATURE_OPERATOR,
+        classifier_type=CLASSIFIER_TYPE,
+        feature_operators=FEATURE_OPERATORS,
+        use_graph_features=USE_GRAPH_FEATURES,
     )
+
+    # Load training graph if graph-structural features are enabled
+    # IMPORTANT: Use the same graph that was used during training (G_train)
+    # to avoid distribution mismatch between train-time and inference-time features.
+    G_train = None
+    pagerank = None
+    if USE_GRAPH_FEATURES:
+        logger.info("Loading training graph for structural features ...")
+        G_train = load_graph_from_adjacency_csv(
+            PATHS["train_graph"], directed=GRAPH_CONFIG["directed"]
+        )
+        logger.info("Computing PageRank (cached for all predictions) ...")
+        pagerank = nx.pagerank(G_train, alpha=0.85, max_iter=50, tol=1e-4)
 
     # ── 2. Load test edges ─────────────────────────────────────────────────────
     logger.info(f"Loading test edges from '{args.test}' ...")
@@ -92,13 +120,23 @@ def main() -> None:
     logger.info(f"Predicting {len(edges):,} candidate edges ...")
 
     # ── 3. Run inference ───────────────────────────────────────────────────────
-    preds = predictor.predict(edges)
+    thrs = [0.9, 0.95, 0.97, 0.98, 0.99, 0.995, 0.999]
+    probas = predictor.predict_proba(edges, G_train=G_train, pagerank=pagerank)
+    for t in thrs:
+        logger.info(f"Applying threshold {t:.3f} to edge probabilities ...")
+        preds = (probas >= t).astype(int)
+        n_edge    = int(preds.sum())
+        n_no_edge = int((preds == 0).sum())
+        logger.info(
+            f"Threshold {t:.3f} → edge=1: {n_edge:,}  |  no-edge=0: {n_no_edge:,}"
+        )
+        out = pd.DataFrame({"Id": df_test["Id"], "Predictions": preds.astype(int)})
+        out.to_csv(f"data/processed/node2vec_{CLASSIFIER_TYPE}_predictions_{t:.3f}.csv", index=False)
 
     # ── 4. Build and save output ───────────────────────────────────────────────
     out = pd.DataFrame({"Id": df_test["Id"], "Predictions": preds.astype(int)})
 
     if args.proba:
-        probas = predictor.predict_proba(edges)
         out["Probability"] = probas.round(4)
         logger.info("Edge probabilities included in output (--proba flag set).")
 
