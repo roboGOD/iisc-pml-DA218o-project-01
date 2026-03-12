@@ -42,7 +42,8 @@ Why these features work
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import List
+import time
 
 import numpy as np
 import pandas as pd
@@ -212,37 +213,27 @@ def extract_features_pair(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Batch extraction
+# Batch extraction  (simple per-pair loop — robust, no scipy dependency)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_features_batch(
     gs: GraphStore,
     pairs: np.ndarray,
     max_intermediaries: int = 500,
-    log_every: int = 50_000,
+    **_kwargs,          # accept (and ignore) _mats= from old call-sites
 ) -> np.ndarray:
     """
-    Extract features for a batch of (u, v) pairs.
+    Extract features for every (u, v) pair in *pairs* (shape N×2).
 
-    Parameters
-    ----------
-    pairs : np.ndarray shape (N, 2) int32/int64
-    max_intermediaries : cap to avoid hub blow-up
-    log_every : log progress every this many pairs
-
-    Returns
-    -------
-    np.ndarray shape (N, NUM_FEATURES) float32
+    Returns np.ndarray of shape (N, NUM_FEATURES) float32.
+    Uses the simple per-pair intersect1d loop — reliable on all graphs.
     """
     N = len(pairs)
-    out = np.zeros((N, NUM_FEATURES), dtype=np.float32)
-
+    out = np.empty((N, NUM_FEATURES), dtype=np.float32)
     for i in range(N):
-        u, v = int(pairs[i, 0]), int(pairs[i, 1])
-        out[i] = extract_features_pair(gs, u, v, max_intermediaries)
-        if log_every > 0 and (i + 1) % log_every == 0:
-            logger.info("  features: %d / %d pairs done …", i + 1, N)
-
+        out[i] = extract_features_pair(
+            gs, int(pairs[i, 0]), int(pairs[i, 1]), max_intermediaries
+        )
     return out
 
 
@@ -251,36 +242,44 @@ def build_dataframe(
     pairs: np.ndarray,
     labels: np.ndarray,
     max_intermediaries: int = 500,
-    batch_size: int = 100_000,
-    log_every: int = 50_000,
+    batch_size: int = 50_000,
 ) -> pd.DataFrame:
     """
     Build a feature DataFrame for supervised training / evaluation.
 
     Parameters
     ----------
-    gs : GraphStore (training graph for feature extraction)
-    pairs : (N, 2) int32 — source and target nodes
+    gs     : GraphStore
+    pairs  : (N, 2) int32 — source and target node IDs
     labels : (N,) int — 1 for positive edges, 0 for negatives
-    batch_size : process this many pairs at once to bound peak memory
-    log_every : passed through to extract_features_batch
-
-    Returns
-    -------
-    pd.DataFrame with columns FEATURE_NAMES + ['label', 'u', 'v']
+    batch_size : chunk size (controls log granularity)
     """
     N = len(pairs)
-    all_feats: list[np.ndarray] = []
+    n_batches = (N + batch_size - 1) // batch_size
+    logger.info("Extracting features for %d pairs (%d batches of %d) …",
+                N, n_batches, batch_size)
 
-    for start in range(0, N, batch_size):
+    all_feats: list[np.ndarray] = []
+    t_start = time.time()
+
+    for bi, start in enumerate(range(0, N, batch_size), 1):
         end = min(start + batch_size, N)
-        logger.info(
-            "Feature extraction: pairs %d–%d / %d …", start + 1, end, N
-        )
+        t_batch = time.time()
         chunk = extract_features_batch(
-            gs, pairs[start:end], max_intermediaries, log_every
+            gs, pairs[start:end],
+            max_intermediaries=max_intermediaries,
         )
         all_feats.append(chunk)
+        elapsed   = time.time() - t_start
+        batch_t   = time.time() - t_batch
+        pct       = 100.0 * end / N
+        eta       = (elapsed / bi) * (n_batches - bi) if bi < n_batches else 0.0
+        logger.info(
+            "  [%d/%d] pairs %d–%d (%.1f%%) | batch=%.1fs | elapsed=%.1fs | ETA=%.1fs",
+            bi, n_batches, start + 1, end, pct, batch_t, elapsed, eta,
+        )
+
+    logger.info("Feature extraction complete in %.1fs.", time.time() - t_start)
 
     X = np.concatenate(all_feats, axis=0)
     df = pd.DataFrame(X, columns=FEATURE_NAMES)

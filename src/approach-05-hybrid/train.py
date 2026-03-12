@@ -1,9 +1,9 @@
 """
-Train a tree-based binary classifier on pre-built structural feature tables.
+Train Approach-05 hybrid classifier (structural + Node2Vec, 153 features).
 
 Usage
 -----
-  # Build feature tables first (if not cached)
+  # Build feature tables first (see README.md for run order)
   python dataset_builder.py
 
   # Train with default config (LightGBM)
@@ -11,15 +11,14 @@ Usage
 
   # Train with specific classifier
   python train.py --classifier hgb
-  python train.py --classifier lgbm
   python train.py --classifier xgb
 
 Artifacts saved
 ---------------
-  models/approach04/model.joblib
-  models/approach04/feature_names.json
-  models/approach04/metrics.json
-  models/approach04/threshold.json
+  models/approach05/model.joblib
+  models/approach05/feature_names.json   (written by dataset_builder)
+  models/approach05/metrics.json
+  models/approach05/threshold.json
 """
 from __future__ import annotations
 
@@ -41,6 +40,10 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+# ── path setup ────────────────────────────────────────────────────────────────
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+
 from config import (
     CLASSIFIER,
     HGB_CONFIG,
@@ -50,7 +53,6 @@ from config import (
     RF_CONFIG,
     XGB_CONFIG,
 )
-from structural_features import FEATURE_NAMES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +61,21 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature names: loaded from JSON (written by dataset_builder.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_feature_names() -> list[str]:
+    fn_path = PATHS["feature_names"]
+    if not os.path.exists(fn_path):
+        raise FileNotFoundError(
+            f"Feature names file not found: {fn_path}\n"
+            "Run dataset_builder.py first."
+        )
+    with open(fn_path) as f:
+        return json.load(f)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,8 +100,7 @@ def _build_classifier(name: str) -> Any:
         except ImportError:
             logger.warning("XGBoost not available, falling back to HGB")
             return HistGradientBoostingClassifier(**HGB_CONFIG)
-        cfg = XGB_CONFIG.copy()
-        return XGBClassifier(**cfg)
+        return XGBClassifier(**XGB_CONFIG)
 
     if name == "hgb":
         return HistGradientBoostingClassifier(**HGB_CONFIG)
@@ -102,11 +118,7 @@ def _build_classifier(name: str) -> Any:
 def find_best_threshold(
     proba: np.ndarray, labels: np.ndarray, step: float = 0.01
 ) -> tuple[float, float]:
-    """
-    Search threshold in [0.05, 0.95] that maximises F1 on validation set.
-
-    Returns (best_threshold, best_f1).
-    """
+    """Search threshold in [0.05, 0.95] that maximises F1 on validation set."""
     best_thr, best_f1 = 0.5, 0.0
     for thr in np.arange(0.05, 0.96, step):
         preds = (proba >= thr).astype(int)
@@ -123,12 +135,12 @@ def find_best_threshold(
 
 def train(
     train_feats_path: str = PATHS["train_feats"],
-    val_feats_path: str = PATHS["val_feats"],
-    model_path: str = PATHS["model"],
+    val_feats_path:   str = PATHS["val_feats"],
+    model_path:       str = PATHS["model"],
     feature_names_path: str = PATHS["feature_names"],
-    metrics_path: str = PATHS["metrics"],
-    threshold_path: str = PATHS["threshold"],
-    classifier_name: str = CLASSIFIER,
+    metrics_path:     str = PATHS["metrics"],
+    threshold_path:   str = PATHS["threshold"],
+    classifier_name:  str = CLASSIFIER,
     rebuild_if_missing: bool = True,
 ) -> None:
     t_total = time.time()
@@ -136,13 +148,20 @@ def train(
     # ── 0. Auto-build datasets if missing ────────────────────────────
     if rebuild_if_missing and not os.path.exists(train_feats_path):
         logger.info("Feature tables not found — running dataset_builder first …")
-        from dataset_builder import build_datasets
-        build_datasets()
+        import dataset_builder
+        dataset_builder.main()
 
-    # ── 1. Load feature tables ────────────────────────────────────────
+    # ── 1. Load feature names and tables ─────────────────────────────
+    FEATURE_NAMES = _load_feature_names()
+    logger.info("Feature names: %d total (%s … %s)", len(FEATURE_NAMES), FEATURE_NAMES[:2], FEATURE_NAMES[-2:])
+
     logger.info("Loading feature tables …")
     df_train = pd.read_parquet(train_feats_path)
     df_val   = pd.read_parquet(val_feats_path)
+
+    missing_train = [c for c in FEATURE_NAMES if c not in df_train.columns]
+    if missing_train:
+        raise ValueError(f"Missing columns in train parquet: {missing_train[:5]}")
 
     logger.info(
         "  train: %d rows   val: %d rows   features: %d",
@@ -162,8 +181,8 @@ def train(
     # ── 2. Baseline: Logistic Regression ─────────────────────────────
     logger.info("Running Logistic Regression baseline …")
     from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
 
     lr = Pipeline([
         ("scaler", StandardScaler()),
@@ -180,11 +199,9 @@ def train(
     clf = _build_classifier(classifier_name)
 
     t0 = time.time()
-
-    # LightGBM and XGBoost accept early stopping via eval_set
-    if classifier_name.lower() in ("lgbm",):
+    if classifier_name.lower() == "lgbm":
         try:
-            from lightgbm import LGBMClassifier, early_stopping, log_evaluation
+            from lightgbm import early_stopping, log_evaluation
             clf.fit(
                 X_train, y_train,
                 eval_set=[(X_val, y_val)],
@@ -211,7 +228,6 @@ def train(
     logger.info("  Training complete in %.1f s", train_time)
 
     # ── 4. Validation metrics ─────────────────────────────────────────
-    logger.info("Evaluating on validation set …")
     val_proba = clf.predict_proba(X_val)[:, 1]
     auc = roc_auc_score(y_val, val_proba)
     ap  = average_precision_score(y_val, val_proba)
@@ -230,7 +246,7 @@ def train(
         "lr_baseline_auc": round(lr_auc, 6),
         "train_rows": int(len(df_train)),
         "val_rows":   int(len(df_val)),
-        "features":   FEATURE_NAMES,
+        "num_features": len(FEATURE_NAMES),
         "train_time_s": round(train_time, 2),
     }
 
@@ -238,13 +254,14 @@ def train(
     if hasattr(clf, "feature_importances_"):
         imp = dict(zip(FEATURE_NAMES, clf.feature_importances_.tolist()))
         imp_sorted = sorted(imp.items(), key=lambda x: -x[1])
-        logger.info("Top-10 feature importances:")
-        for feat, score in imp_sorted[:10]:
-            logger.info("  %-30s %.6f", feat, score)
+        logger.info("Top-15 feature importances:")
+        for feat, score in imp_sorted[:15]:
+            logger.info("  %-38s %.6f", feat, score)
         metrics["feature_importances"] = imp
 
     # ── 6. Save artifacts ─────────────────────────────────────────────
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
     joblib.dump(clf, model_path)
     logger.info("Model saved → %s", model_path)
 
@@ -272,7 +289,7 @@ def train(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train Approach-04 structural GBDT")
+    p = argparse.ArgumentParser(description="Train Approach-05 hybrid GBDT")
     p.add_argument(
         "--classifier", default=CLASSIFIER,
         choices=["lgbm", "xgb", "hgb", "rf"],

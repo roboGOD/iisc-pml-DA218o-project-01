@@ -54,12 +54,18 @@ SPLIT_CONFIG = {
 FEATURE_OPERATOR = "hadamard"
 
 # ── Logistic Regression ───────────────────────────────────────────────────────
+# MAX_LR_PAIRS: cap training pairs fed to LR (LR is convex — 500K rows gives
+# the same accuracy as 19M rows at 1/38th the memory). The 19M-pair OOM killed
+# the previous run; this prevents it.
+MAX_LR_PAIRS = 500_000
+
 LR_CONFIG = {
     "C":            0.9,
-    "max_iter":     1000,
-    "solver":       "lbfgs",
-    "class_weight": "balanced",   # handles any residual class imbalance
+    "max_iter":     300,
+    "solver":       "saga",        # mini-batch SGD; memory-efficient for large N
+    "class_weight": "balanced",
     "random_state": RANDOM_SEED,
+    "n_jobs":       -1,
 }
 
 # ── File paths ─────────────────────────────────────────────────────────────────

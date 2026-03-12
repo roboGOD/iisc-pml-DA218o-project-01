@@ -96,6 +96,14 @@ def main() -> None:
     )
 
     predictor.fit_embeddings(G_train)
+
+    # ── Save embeddings immediately (crash-safe) ───────────────────────────────
+    # This runs BEFORE fit_classifier so the ~6h Word2Vec work is never lost
+    # even if the LR step runs out of memory.
+    os.makedirs(os.path.dirname(PATHS["embeddings"]), exist_ok=True)
+    predictor.wv.save(PATHS["embeddings"])
+    logger.info(f"Embeddings saved early (crash-safe) → '{PATHS['embeddings']}'")
+
     predictor.fit_classifier(train_pos, train_neg)
 
     # ── 4. Evaluate on validation and test sets ────────────────────────────────

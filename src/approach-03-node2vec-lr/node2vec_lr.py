@@ -211,11 +211,33 @@ class Node2VecLinkPredictor:
         self,
         train_pos: List[Tuple],
         train_neg: List[Tuple],
+        max_pairs: Optional[int] = None,
     ) -> None:
         """
         Build Hadamard (or chosen operator) edge features and train the
         Logistic Regression pipeline (StandardScaler + LR).
+
+        max_pairs caps the number of *positive* pairs used for training.
+        The same cap is applied to negatives to keep the dataset balanced.
+        Defaults to MAX_LR_PAIRS from config (500k) to avoid OOM on 19M+ pairs.
         """
+        from config import MAX_LR_PAIRS
+        if max_pairs is None:
+            max_pairs = MAX_LR_PAIRS
+
+        # Subsample if the split is larger than the cap
+        rng = np.random.default_rng(self.seed)
+        if len(train_pos) > max_pairs:
+            idx = rng.choice(len(train_pos), size=max_pairs, replace=False)
+            train_pos = [train_pos[i] for i in idx]
+            logger.info(
+                f"Subsampled positives: {len(idx):,} / {len(train_pos) + len(idx):,} "
+                f"(max_pairs={max_pairs:,})"
+            )
+        if len(train_neg) > max_pairs:
+            idx = rng.choice(len(train_neg), size=max_pairs, replace=False)
+            train_neg = [train_neg[i] for i in idx]
+
         logger.info("Building training feature matrix ...")
         X_train, y_train = build_dataset(
             self.wv, train_pos, train_neg,

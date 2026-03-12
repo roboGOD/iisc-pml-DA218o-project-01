@@ -1,0 +1,22 @@
+{
+  "val": {
+    "split": "val",
+    "roc_auc": 0.5003,
+    "avg_precision": 0.5118,
+    "f1": 0.4739,
+    "precision": 0.5292,
+    "recall": 0.4291,
+    "n_pos": 2394560,
+    "n_neg": 2394560
+  },
+  "test": {
+    "split": "test",
+    "roc_auc": 0.5004,
+    "avg_precision": 0.512,
+    "f1": 0.4739,
+    "precision": 0.5293,
+    "recall": 0.429,
+    "n_pos": 2394560,
+    "n_neg": 2394560
+  }
+}

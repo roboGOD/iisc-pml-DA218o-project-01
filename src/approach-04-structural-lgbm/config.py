@@ -4,25 +4,33 @@ Configuration for Approach-04: Directed Structural Feature Engineering + GBDT.
 Node IDs in this dataset are dense integers in [0, 4_867_135], so no ID
 mapping dictionary is needed — the array index IS the node ID.
 """
+import os as _os
+
+# Project root = two levels above this file (src/approach-04-structural-lgbm/ → project root)
+_ROOT = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", ".."))
+
+def _p(*parts: str) -> str:
+    """Return an absolute path anchored at the project root."""
+    return _os.path.join(_ROOT, *parts)
 
 # ── Reproducibility ────────────────────────────────────────────────────────────
 RANDOM_SEED = 42
 
 # ── File paths ─────────────────────────────────────────────────────────────────
 PATHS = {
-    "train_graph":   "data/raw/train.csv",
-    "test_edges":    "data/raw/test.csv",
+    "train_graph":   _p("data", "raw", "train.csv"),
+    "test_edges":    _p("data", "raw", "test.csv"),
     # Cached feature tables (parquet); created by dataset_builder.py
-    "train_feats":   "data/processed/approach04/train_features.parquet",
-    "val_feats":     "data/processed/approach04/val_features.parquet",
-    "test_feats":    "data/processed/approach04/test_features.parquet",
+    "train_feats":   _p("data", "processed", "approach04", "train_features.parquet"),
+    "val_feats":     _p("data", "processed", "approach04", "val_features.parquet"),
+    "test_feats":    _p("data", "processed", "approach04", "test_features.parquet"),
     # Model artifacts
-    "model":         "models/approach04/model.joblib",
-    "feature_names": "models/approach04/feature_names.json",
-    "metrics":       "models/approach04/metrics.json",
-    "threshold":     "models/approach04/threshold.json",
+    "model":         _p("models", "approach04", "model.joblib"),
+    "feature_names": _p("models", "approach04", "feature_names.json"),
+    "metrics":       _p("models", "approach04", "metrics.json"),
+    "threshold":     _p("models", "approach04", "threshold.json"),
     # Predictions
-    "predictions":   "data/processed/approach04/predictions.csv",
+    "predictions":   _p("data", "processed", "approach04", "predictions.csv"),
 }
 
 # ── Graph ─────────────────────────────────────────────────────────────────────
@@ -42,15 +50,15 @@ SPLIT_CONFIG = {
 NEG_SAMPLING = {
     # Ratio of negatives to positives (1.0 = balanced)
     "neg_ratio": 1.0,
-    # Fraction of negatives that are "hard" (2-hop / shared-follower)
-    "train_hard_frac": 0.50,
-    "val_hard_frac":   0.70,
-    # Maximum number of positive pairs used for training
-    # Set to None to use all (~19.2M → slow but thorough)
-    "max_train_pos": 500_000,
-    "max_val_pos":   100_000,
-    # Degree cap for hub nodes in hard negative sampling
-    # Avoids O(degree²) explosion on nodes with 100k+ followers
+    # Hard negatives (2-hop) caused label inversion on Kaggle test set:
+    # test positives are REMOVED edges that look structurally like 2-hop pairs.
+    # Setting hard_frac=0 uses pure random negatives to match test distribution.
+    "train_hard_frac": 0.0,
+    "val_hard_frac":   0.0,
+    # Use more training data now that hard negative computation is skipped (fast)
+    "max_train_pos": 5_000_000,
+    "max_val_pos":   500_000,
+    # Degree cap for hub nodes in hard negative sampling (kept for reference)
     "hub_degree_cap": 2_000,
 }
 
@@ -64,11 +72,12 @@ FEATURE_CONFIG = {
 }
 
 # ── Classifier ────────────────────────────────────────────────────────────────
-# "lgbm"  → LightGBM (fastest, GPU support)
+# "lgbm"  → LightGBM (CPU-only build; no GPU support in standard pip package)
+# "xgb"   → XGBoost  (CUDA GPU, recommended on H100)
 # "xgb"   → XGBoost
 # "hgb"   → sklearn HistGradientBoostingClassifier (no extra deps)
 # "rf"    → sklearn RandomForestClassifier (benchmark)
-CLASSIFIER = "lgbm"
+CLASSIFIER = "xgb"   # XGBoost CUDA (GPU); use --classifier lgbm for CPU LightGBM
 
 LGBM_CONFIG = {
     "n_estimators":    1000,
@@ -83,7 +92,7 @@ LGBM_CONFIG = {
     "reg_lambda":      0.1,
     "objective":       "binary",
     "metric":          "auc",
-    "device":          "gpu",       # GPU-accelerated tree building (LightGBM CUDA)
+    "device":          "cpu",       # standard pip lightgbm has no GPU; use xgb for GPU
     "n_jobs":          -1,
     "verbose":         -1,
     "random_state":    RANDOM_SEED,

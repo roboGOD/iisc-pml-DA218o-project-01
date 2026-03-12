@@ -1,20 +1,16 @@
 """
-Dataset builder: parses the raw graph, splits edges, samples negatives,
-extracts structural features, and saves train/val/test tables as parquet.
+Dataset builder for Approach-04b (Phase A + Phase B features).
 
-Run standalone:
+Additions over approach-04:
+  - Builds Leiden community partition (once, cached to .npy)
+  - Passes CommunityStore to build_dataframe for 7 extra Phase B features
+
+Run:
     python dataset_builder.py
-
-Artifacts created
------------------
-  data/processed/approach04/train_features.parquet
-  data/processed/approach04/val_features.parquet
-  data/processed/approach04/test_features.parquet   (Kaggle test set)
 """
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
@@ -27,9 +23,11 @@ from config import (
     FEATURE_CONFIG,
     NEG_SAMPLING,
     PATHS,
+    PHASE_B_CONFIG,
     RANDOM_SEED,
     SPLIT_CONFIG,
 )
+from community_store import CommunityStore, build_communities
 from graph_store import GraphStore
 from negative_sampling import sample_mixed_negatives
 from structural_features import FEATURE_NAMES, build_dataframe
@@ -44,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Edge split
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train_val_split(
@@ -53,41 +51,22 @@ def train_val_split(
     val_ratio: float,
     seed: int = RANDOM_SEED,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Randomly split all directed edges into train and validation sets.
-
-    Returns (train_src, train_dst, val_src, val_dst).
-    """
     rng = np.random.default_rng(seed)
-    N = len(src)
-    perm = rng.permutation(N)
-
-    n_val = int(N * val_ratio)
+    perm = rng.permutation(len(src))
+    n_val = int(len(src) * val_ratio)
     val_idx   = perm[:n_val]
     train_idx = perm[n_val:]
+    return src[train_idx], dst[train_idx], src[val_idx], dst[val_idx]
 
-    return (
-        src[train_idx], dst[train_idx],
-        src[val_idx],   dst[val_idx],
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Kaggle test reader
-# ─────────────────────────────────────────────────────────────────────────────
 
 def read_test_edges(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Read test.csv (Id, From, To) — handles BOM.
-
-    Returns (ids, src_arr, dst_arr), all as int32/int64.
-    """
-    df = pd.read_csv(path, encoding="utf-8-sig")  # utf-8-sig strips BOM
+    df = pd.read_csv(path, encoding="utf-8-sig")
     df.columns = [c.strip() for c in df.columns]
-    ids = df["Id"].to_numpy(dtype=np.int64)
-    src = df["From"].to_numpy(dtype=np.int32)
-    dst = df["To"].to_numpy(dtype=np.int32)
-    return ids, src, dst
+    return (
+        df["Id"].to_numpy(dtype=np.int64),
+        df["From"].to_numpy(dtype=np.int32),
+        df["To"].to_numpy(dtype=np.int32),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,6 +76,7 @@ def read_test_edges(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 def build_datasets(
     train_graph_path: str = PATHS["train_graph"],
     test_edges_path: str = PATHS["test_edges"],
+    communities_path: str = PATHS["communities"],
     out_dir_train: str = PATHS["train_feats"],
     out_dir_val: str = PATHS["val_feats"],
     out_dir_test: str = PATHS["test_feats"],
@@ -108,26 +88,47 @@ def build_datasets(
     val_hard_frac: float = NEG_SAMPLING["val_hard_frac"],
     hub_degree_cap: int = NEG_SAMPLING["hub_degree_cap"],
     max_intermediaries: int = FEATURE_CONFIG["max_intermediaries"],
+    use_community: bool = PHASE_B_CONFIG["use_community"],
+    leiden_resolution: float = PHASE_B_CONFIG["leiden_resolution"],
+    nbr_sample_k: int = PHASE_B_CONFIG["nbr_sample_k"],
+    nbr_list_cap: int = PHASE_B_CONFIG["nbr_list_cap"],
     seed: int = RANDOM_SEED,
 ) -> None:
     t_total = time.time()
 
     # ── 1. Load full graph ────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("Step 1/6 — Loading training graph")
+    logger.info("Step 1/7 — Loading training graph")
     gs_full = GraphStore.from_adjacency_csv(train_graph_path)
     full_src, full_dst = gs_full.edge_list()
     logger.info("Full graph: %s", gs_full)
 
-    # ── 2. Train / val split ──────────────────────────────────────────
-    logger.info("Step 2/6 — Splitting edges (val_ratio=%.2f)", val_ratio)
+    # ── 2. Build / load communities ───────────────────────────────────
+    cs: CommunityStore | None = None
+    if use_community:
+        logger.info("Step 2/7 — Building Leiden communities")
+        try:
+            community_ids = build_communities(
+                gs_full, communities_path,
+                resolution=leiden_resolution, seed=seed,
+            )
+            cs = CommunityStore(community_ids)
+            logger.info("  %s", cs)
+        except ImportError as e:
+            logger.warning(
+                "Community detection unavailable (%s). "
+                "Community features will be zeros.",
+                e,
+            )
+    else:
+        logger.info("Step 2/7 — Community features disabled (use_community=False)")
+
+    # ── 3. Train / val split ──────────────────────────────────────────
+    logger.info("Step 3/7 — Splitting edges (val_ratio=%.2f)", val_ratio)
     tr_src, tr_dst, val_src, val_dst = train_val_split(
         full_src, full_dst, val_ratio, seed
     )
-    logger.info(
-        "  train positives: %d   val positives: %d",
-        len(tr_src), len(val_src),
-    )
+    logger.info("  train positives: %d   val positives: %d", len(tr_src), len(val_src))
 
     # ── Build two graph stores ────────────────────────────────────────
     # gs_train : train edges ONLY — used for train and val feature extraction.
@@ -139,7 +140,7 @@ def build_datasets(
     # gs_full  : all train.csv edges — used ONLY for Kaggle test features.
     #   The competition has already removed test edges from train.csv, so
     #   gs_full correctly represents the graph at inference time.
-    logger.info("Step 3/6 — Building train-only graph store (val leakage fix)")
+    logger.info("Step 3b — Building train-only graph store (val leakage fix)")
     gs_train = GraphStore(num_nodes=gs_full.num_nodes, src=tr_src, dst=tr_dst)
     logger.info("  gs_train: %d nodes, %d edges", gs_train.num_nodes, gs_train.num_edges)
     logger.info("  gs_full:  %d nodes, %d edges (Kaggle test features only)",
@@ -147,85 +148,75 @@ def build_datasets(
     # train + val features both use gs_train; Kaggle test uses gs_full
     gs_feat = gs_train
 
-    # ── 3. Subsample positives ────────────────────────────────────────
+    # ── 4. Subsample positives ────────────────────────────────────────
+    logger.info("Step 4/7 — Subsampling positives")
     rng = np.random.default_rng(seed)
 
-    def _subsample(
-        s: np.ndarray, d: np.ndarray, max_n: int | None
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if max_n is not None and len(s) > max_n:
-            idx = rng.choice(len(s), max_n, replace=False)
+    def _sub(s, d, maxn):
+        if maxn and len(s) > maxn:
+            idx = rng.choice(len(s), maxn, replace=False)
             return s[idx], d[idx]
         return s, d
 
-    tr_src_s, tr_dst_s = _subsample(tr_src, tr_dst, max_train_pos)
-    val_src_s, val_dst_s = _subsample(val_src, val_dst, max_val_pos)
-    logger.info(
-        "  subsampled train=%d, val=%d",
-        len(tr_src_s), len(val_src_s),
-    )
+    tr_src, tr_dst = _sub(tr_src, tr_dst, max_train_pos)
+    val_src, val_dst = _sub(val_src, val_dst, max_val_pos)
+    logger.info("  subsampled train=%d, val=%d", len(tr_src), len(val_src))
 
-    # ── 4. Sample negatives ───────────────────────────────────────────
-    logger.info("Step 4/6 — Sampling negatives")
+    # ── 5. Sample negatives ───────────────────────────────────────────
+    logger.info("Step 5/7 — Sampling negatives")
+    train_pos = np.stack([tr_src, tr_dst], axis=1).astype(np.int32)
+    val_pos   = np.stack([val_src, val_dst], axis=1).astype(np.int32)
+
+    n_train_neg = int(len(tr_src) * neg_ratio)
+    n_val_neg   = int(len(val_src) * neg_ratio)
+
     t4 = time.time()
-    train_pos_pairs = np.stack([tr_src_s, tr_dst_s], axis=1).astype(np.int32)
-    val_pos_pairs   = np.stack([val_src_s, val_dst_s], axis=1).astype(np.int32)
-
-    n_train_neg = int(len(tr_src_s) * neg_ratio)
-    n_val_neg   = int(len(val_src_s) * neg_ratio)
-
-    logger.info("  sampling %d train negatives (hard_frac=%.2f)…", n_train_neg, train_hard_frac)
-    train_neg_pairs = sample_mixed_negatives(
-        gs_feat, n_train_neg,
-        hard_frac=train_hard_frac,
-        seed=seed,
-        hub_degree_cap=hub_degree_cap,
-        exclude_pairs=train_pos_pairs,
+    logger.info("  Sampling %d train negatives (hard_frac=%.2f)…", n_train_neg, train_hard_frac)
+    train_neg = sample_mixed_negatives(
+        gs_feat, n_train_neg, hard_frac=train_hard_frac,
+        seed=seed, hub_degree_cap=hub_degree_cap, exclude_pairs=train_pos,
     )
-    logger.info("  train negatives done in %.1fs", time.time() - t4)
+    logger.info("  Train negatives done in %.1fs", time.time() - t4)
 
     t4v = time.time()
-    logger.info("  sampling %d val negatives (hard_frac=%.2f)…", n_val_neg, val_hard_frac)
-    val_neg_pairs = sample_mixed_negatives(
-        gs_feat, n_val_neg,
-        hard_frac=val_hard_frac,
-        seed=seed + 10,
-        hub_degree_cap=hub_degree_cap,
-        exclude_pairs=val_pos_pairs,
+    logger.info("  Sampling %d val negatives (hard_frac=%.2f)…", n_val_neg, val_hard_frac)
+    val_neg = sample_mixed_negatives(
+        gs_feat, n_val_neg, hard_frac=val_hard_frac,
+        seed=seed + 10, hub_degree_cap=hub_degree_cap, exclude_pairs=val_pos,
     )
-    logger.info("  val negatives done in %.1fs | Step 4 total %.1fs",
+    logger.info("  Val negatives done in %.1fs | Step 5 total %.1fs",
                 time.time() - t4v, time.time() - t4)
 
-    # ── 5. Combine and featurise ──────────────────────────────────────
-    logger.info("Step 5/6 — Extracting structural features")
+    # ── 6. Featurize ──────────────────────────────────────────────────
+    logger.info("Step 6/7 — Extracting structural features (Phase A + B)")
 
     def _make_table(pos: np.ndarray, neg: np.ndarray, name: str) -> pd.DataFrame:
         pairs  = np.concatenate([pos, neg], axis=0)
         labels = np.concatenate([
-            np.ones(len(pos), dtype=np.int8),
+            np.ones(len(pos),  dtype=np.int8),
             np.zeros(len(neg), dtype=np.int8),
         ])
         perm = rng.permutation(len(pairs))
-        logger.info("  [%s] %d pairs (%d pos + %d neg) — starting feature extraction",
-                    name, len(pairs), len(pos), len(neg))
+        logger.info("  [%s] %d pairs (%d pos + %d neg)", name, len(pairs), len(pos), len(neg))
         t = time.time()
         df = build_dataframe(
             gs_feat, pairs[perm], labels[perm],
             max_intermediaries=max_intermediaries,
+            cs=cs,
+            nbr_sample_k=nbr_sample_k,
+            nbr_list_cap=nbr_list_cap,
+            seed=seed,
         )
         logger.info("  [%s] done in %.1fs", name, time.time() - t)
         return df
 
-    logger.info("  Building TRAIN table (%d pairs)…", len(train_pos_pairs) + len(train_neg_pairs))
-    df_train = _make_table(train_pos_pairs, train_neg_pairs, "TRAIN")
+    df_train = _make_table(train_pos, train_neg, "TRAIN")
+    df_val   = _make_table(val_pos,   val_neg,   "VAL")
 
-    logger.info("  Building VAL table (%d pairs)…", len(val_pos_pairs) + len(val_neg_pairs))
-    df_val = _make_table(val_pos_pairs, val_neg_pairs, "VAL")
-
-    # ── 6. Kaggle test features ───────────────────────────────────────
+    # ── Kaggle test ───────────────────────────────────────────────────
     # Use gs_full here: all train.csv edges are available at inference time
     # (Kaggle already removed test edges from train.csv before publishing).
-    logger.info("  Building TEST table (Kaggle, %s)…", test_edges_path)
+    logger.info("  Building TEST table …")
     t_test = time.time()
     test_ids, test_src, test_dst = read_test_edges(test_edges_path)
     test_pairs = np.stack([test_src, test_dst], axis=1).astype(np.int32)
@@ -233,12 +224,16 @@ def build_datasets(
         gs_full, test_pairs,
         labels=np.zeros(len(test_pairs), dtype=np.int8),
         max_intermediaries=max_intermediaries,
+        cs=cs,
+        nbr_sample_k=nbr_sample_k,
+        nbr_list_cap=nbr_list_cap,
+        seed=seed,
     )
     test_X["Id"] = test_ids
     logger.info("  [TEST] done in %.1fs", time.time() - t_test)
 
     # ── 7. Save ───────────────────────────────────────────────────────
-    logger.info("Step 6/6 — Saving feature tables")
+    logger.info("Step 7/7 — Saving feature tables")
     for path, df, name in [
         (out_dir_train, df_train, "train"),
         (out_dir_val,   df_val,   "val"),
@@ -246,18 +241,13 @@ def build_datasets(
     ]:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         df.to_parquet(path, index=False)
-        logger.info("  saved %s → %s (%d rows)", name, path, len(df))
+        logger.info("  saved %s → %s (%d rows, %d features)",
+                    name, path, len(df), len(FEATURE_NAMES))
 
-    elapsed = time.time() - t_total
-    logger.info("Dataset build complete in %.1f s", elapsed)
-
-    # ── Summary stats ─────────────────────────────────────────────────
+    logger.info("Dataset build complete in %.1fs", time.time() - t_total)
     for name, df in [("train", df_train), ("val", df_val)]:
         pos = df["label"].sum()
-        logger.info(
-            "  [%s] rows=%d, pos=%d (%.1f%%), features=%d",
-            name, len(df), pos, 100 * pos / len(df), len(FEATURE_NAMES),
-        )
+        logger.info("  [%s] rows=%d, pos=%d (%.1f%%)", name, len(df), pos, 100*pos/len(df))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,16 +255,12 @@ def build_datasets(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Build structural feature tables for Approach 04"
-    )
-    p.add_argument("--graph",    default=PATHS["train_graph"], help="Adjacency CSV path")
-    p.add_argument("--test",     default=PATHS["test_edges"],  help="Kaggle test CSV path")
-    p.add_argument("--max-train-pos", type=int, default=NEG_SAMPLING["max_train_pos"],
-                   help="Max positive pairs for training set (None = all)")
-    p.add_argument("--max-val-pos",   type=int, default=NEG_SAMPLING["max_val_pos"],
-                   help="Max positive pairs for validation set")
-    p.add_argument("--seed",     type=int, default=RANDOM_SEED)
+    p = argparse.ArgumentParser(description="Build Phase A+B feature tables")
+    p.add_argument("--graph",   default=PATHS["train_graph"])
+    p.add_argument("--test",    default=PATHS["test_edges"])
+    p.add_argument("--no-community", action="store_true",
+                   help="Skip Leiden (zero-fill community features)")
+    p.add_argument("--seed", type=int, default=RANDOM_SEED)
     return p.parse_args()
 
 
@@ -283,7 +269,6 @@ if __name__ == "__main__":
     build_datasets(
         train_graph_path=args.graph,
         test_edges_path=args.test,
-        max_train_pos=args.max_train_pos,
-        max_val_pos=args.max_val_pos,
+        use_community=not args.no_community,
         seed=args.seed,
     )

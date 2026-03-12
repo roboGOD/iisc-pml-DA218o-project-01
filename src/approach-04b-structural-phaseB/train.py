@@ -16,10 +16,10 @@ Usage
 
 Artifacts saved
 ---------------
-  models/approach04/model.joblib
-  models/approach04/feature_names.json
-  models/approach04/metrics.json
-  models/approach04/threshold.json
+  models/approach04b/model.joblib
+  models/approach04b/feature_names.json
+  models/approach04b/metrics.json
+  models/approach04b/threshold.json
 """
 from __future__ import annotations
 
@@ -272,7 +272,7 @@ def train(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train Approach-04 structural GBDT")
+    p = argparse.ArgumentParser(description="Train Approach-04b structural GBDT")
     p.add_argument(
         "--classifier", default=CLASSIFIER,
         choices=["lgbm", "xgb", "hgb", "rf"],

@@ -1,5 +1,7 @@
 """
-Graph utilities: loading, edge splitting, and negative sampling.
+Graph utilities: loading and edge splitting.
+
+Negative sampling has been moved to ``negative_sampling.py``.
 """
 import csv
 import logging
@@ -7,8 +9,9 @@ import random
 from typing import List, Set, Tuple
 
 import networkx as nx
-import numpy as np
 from tqdm import tqdm
+
+from negative_sampling import GraphAdapter, sample_mixed_negatives
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +173,6 @@ def train_val_test_split(
     train_neg, val_neg, test_neg  : negative edge lists
     """
     rng    = random.Random(seed)
-    np_rng = np.random.default_rng(seed)
 
     all_edges = list(G.edges())
     rng.shuffle(all_edges)
@@ -198,180 +200,53 @@ def train_val_test_split(
         f"{G_train.number_of_edges():,} edges"
     )
 
-    # ── Hard Negative sampling ────────────────────────────────────────────────
+    # ── Negative sampling ─────────────────────────────────────────────────────
     #
-    # Why hard negatives matter for Twitter
-    # ─────────────────────────────────────
-    # Random node pairs are "easy" negatives — two arbitrary users almost
-    # certainly share no common follows and look nothing alike structurally.
-    # A classifier trained on easy negatives learns a trivial rule and
-    # achieves inflated val/test scores that don't reflect real performance.
+    # Delegate to negative_sampling.py which exposes three public functions:
+    #   sample_easy_negatives / sample_hard_negatives / sample_mixed_negatives
     #
-    # Hard negatives are node pairs that LOOK like they should have an edge
-    # but don't.  On a follow graph the most natural hard negative is:
+    # A single shared ``seen_codes`` set is threaded across all three split
+    # calls so no negative pair can appear in more than one split.
     #
-    #   u follows w,  w follows v,  but u does NOT follow v
-    #
-    # i.e. "friend-of-a-friend" pairs.  These share structural context
-    # (they appear in the same walk windows) yet have no direct edge, so
-    # the classifier must learn finer-grained structural distinctions.
-    #
-    # Strategy — three tiers, sampled in priority order:
-    #
-    #   Tier 1 — 2-hop paths  (u → w → v, no u → v)
-    #     Strongest signal: v is reachable from u through a mutual follow.
-    #     Directly mimics how Twitter's "who to follow" surface works.
-    #
-    #   Tier 2 — shared follower pairs  (w → u, w → v, no u → v)
-    #     u and v are both followed by the same account w — they occupy
-    #     similar audience positions (e.g. two sports journalists) but
-    #     u doesn't follow v.  Tests whether interest-cluster similarity
-    #     alone is enough to predict a follow.
-    #
-    #   Tier 3 — random fallback
-    #     For any samples not filled by Tiers 1/2 (sparse nodes, dense
-    #     graphs) we fall back to random sampling so n_samples is always met.
-    #
-    # hard_ratio controls the tier-1/2 budget:
-    #   hard_ratio=0.8 → 80 % hard, 20 % random fallback
+    # Default mix (following the Fire "hard dataset" recommendations):
+    #   train       — 50 % hard, 50 % easy
+    #   val / test  — 70 % hard, 30 % easy  (harder eval = more honest signal)
 
-    existing_edges: Set[Tuple] = set(G.edges())
-    nodes   = list(G.nodes())
-    n_nodes = len(nodes)
+    logger.info("Building GraphAdapter for negative sampling ...")
+    adapter    = GraphAdapter.from_digraph(G_train)
+    seen_codes: Set[int] = set()   # shared across all three splits
 
-    # Pre-build successor / predecessor index as plain lists for O(1) sampling.
-    # NetworkX's adjacency views are fine for lookup but slow to sample from
-    # repeatedly at scale; converting to lists pays off for millions of samples.
-    logger.info("Pre-building adjacency index for hard negative sampling ...")
-    successors   = {u: list(G.successors(u))   for u in G.nodes()}
-    predecessors = {v: list(G.predecessors(v)) for v in G.nodes()}
-
-    def _sample_hard_negatives(
-        n_samples:  int,
-        hard_ratio: float = 0.8,
-    ) -> List[Tuple]:
-        """
-        Sample hard negatives for a Twitter-style directed follow graph.
-
-        Parameters
-        ----------
-        n_samples  : total number of negative pairs to return
-        hard_ratio : fraction of n_samples to attempt via Tier-1/2 strategies
-                     before falling back to random sampling
-
-        Returns
-        -------
-        List of (u, v) node pairs guaranteed to have no edge in G and not
-        already present in existing_edges.
-        """
-        negatives:  List[Tuple] = []
-        seen_candidates: Set[Tuple] = set()   # local dedup within this call
-
-        def _is_valid(u, v) -> bool:
-            """True iff (u,v) is a genuine unseen non-edge."""
-            if u == v:
-                return False
-            candidate = (u, v)
-            if candidate in existing_edges:
-                return False
-            if candidate in seen_candidates:
-                return False
-            return True
-
-        def _accept(u, v) -> bool:
-            """Validate, register in both dedup sets, append."""
-            if not _is_valid(u, v):
-                return False
-            candidate = (u, v)
-            negatives.append(candidate)
-            seen_candidates.add(candidate)
-            existing_edges.add(candidate)   # prevent re-use across splits
-            return True
-
-        n_hard    = int(n_samples * hard_ratio)
-        max_attempts_per_tier = n_hard * 8   # generous budget before giving up
-
-        # ── Tier 1: 2-hop paths  (u → w → v,  no u → v) ─────────────────────
-        # Intuition: v is a "friend of a friend" — the most natural candidate
-        # for a new follow that the model must learn to reject when absent.
-        attempts = 0
-        while len(negatives) < n_hard // 2 and attempts < max_attempts_per_tier:
-            attempts += 1
-            u = nodes[int(np_rng.integers(n_nodes))]
-            u_out = successors.get(u)
-            if not u_out:
-                continue
-            # Pick a random account u follows
-            w = u_out[int(np_rng.integers(len(u_out)))]
-            w_out = successors.get(w)
-            if not w_out:
-                continue
-            # Pick someone w follows — candidate for u to follow
-            v = w_out[int(np_rng.integers(len(w_out)))]
-            _accept(u, v)
-
-        tier1_count = len(negatives)
-        logger.debug(f"Hard negatives — Tier 1 (2-hop): {tier1_count:,}")
-
-        # ── Tier 2: shared-follower pairs  (w → u, w → v,  no u → v) ────────
-        # Intuition: u and v share an audience (both followed by w) so they
-        # likely occupy the same interest niche, making (u,v) a plausible but
-        # absent edge.
-        attempts = 0
-        while len(negatives) < n_hard and attempts < max_attempts_per_tier:
-            attempts += 1
-            # Pick a random "pivot" follower w
-            w = nodes[int(np_rng.integers(n_nodes))]
-            w_out = successors.get(w)
-            if not w_out or len(w_out) < 2:
-                continue
-            # Pick two distinct accounts that w follows
-            idx_u, idx_v = np_rng.choice(len(w_out), size=2, replace=False)
-            u = w_out[int(idx_u)]
-            v = w_out[int(idx_v)]
-            _accept(u, v)
-
-        tier2_count = len(negatives) - tier1_count
-        logger.debug(f"Hard negatives — Tier 2 (shared follower): {tier2_count:,}")
-
-        # ── Tier 3: random fallback ───────────────────────────────────────────
-        # Fills any shortfall from Tiers 1/2 (isolated nodes, very dense graph).
-        fallback_attempts = 0
-        max_fallback      = (n_samples - len(negatives)) * 30
-        while len(negatives) < n_samples and fallback_attempts < max_fallback:
-            fallback_attempts += 1
-            u = nodes[int(np_rng.integers(n_nodes))]
-            v = nodes[int(np_rng.integers(n_nodes))]
-            _accept(u, v)
-
-        fallback_count = len(negatives) - tier1_count - tier2_count
-        logger.debug(f"Hard negatives — Tier 3 (random fallback): {fallback_count:,}")
-
-        if len(negatives) < n_samples:
-            logger.warning(
-                f"Hard negative sampling: only collected {len(negatives):,}/"
-                f"{n_samples:,} pairs  "
-                f"(Tier1={tier1_count:,}, Tier2={tier2_count:,}, "
-                f"Fallback={fallback_count:,}).  "
-                "Graph may be very dense — consider reducing neg_ratio."
-            )
-
-        return negatives[:n_samples]
-
-    logger.info("Sampling hard negative edges ...")
+    logger.info("Sampling train negative edges ...")
     n_train_neg = int(len(train_pos) * neg_ratio)
-    n_val_neg   = int(len(val_pos)   * neg_ratio)
-    n_test_neg  = int(len(test_pos)  * neg_ratio)
+    train_neg   = sample_mixed_negatives(
+        adapter, n_train_neg,
+        hard_frac=0.5, easy_frac=0.5,
+        seed=seed,
+        seen_codes=seen_codes,
+    )
 
-    train_neg = _sample_hard_negatives(n_train_neg)
-    val_neg   = _sample_hard_negatives(n_val_neg)
-    test_neg  = _sample_hard_negatives(n_test_neg)
+    logger.info("Sampling val negative edges ...")
+    n_val_neg = int(len(val_pos) * neg_ratio)
+    val_neg   = sample_mixed_negatives(
+        adapter, n_val_neg,
+        hard_frac=0.7, easy_frac=0.3,
+        seed=seed + 1,
+        seen_codes=seen_codes,
+    )
+
+    logger.info("Sampling test negative edges ...")
+    n_test_neg = int(len(test_pos) * neg_ratio)
+    test_neg   = sample_mixed_negatives(
+        adapter, n_test_neg,
+        hard_frac=0.7, easy_frac=0.3,
+        seed=seed + 2,
+        seen_codes=seen_codes,
+    )
 
     logger.info(
-        f"Negatives sampled  →  "
-        f"train: {len(train_neg):,}  |  "
-        f"val: {len(val_neg):,}  |  "
-        f"test: {len(test_neg):,}"
+        "Negatives sampled  →  "
+        "train: %d  |  val: %d  |  test: %d",
+        len(train_neg), len(val_neg), len(test_neg),
     )
 
     return (
