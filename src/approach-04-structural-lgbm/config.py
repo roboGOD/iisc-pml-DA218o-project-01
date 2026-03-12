@@ -50,14 +50,13 @@ SPLIT_CONFIG = {
 NEG_SAMPLING = {
     # Ratio of negatives to positives (1.0 = balanced)
     "neg_ratio": 1.0,
-    # Hard negatives (2-hop) caused label inversion on Kaggle test set:
-    # test positives are REMOVED edges that look structurally like 2-hop pairs.
-    # Setting hard_frac=0 uses pure random negatives to match test distribution.
+    # Kaggle test negatives are random (confirmed by experiments: hard_frac>0
+    # consistently drops Kaggle AUC from 0.77 to 0.67-0.70). Keep both at 0.0
+    # so the model learns a boundary against random negatives — matching test.
     "train_hard_frac": 0.0,
     "val_hard_frac":   0.0,
-    # Use more training data now that hard negative computation is skipped (fast)
-    "max_train_pos": 5_000_000,
-    "max_val_pos":   500_000,
+    "max_train_pos": 1_000_000,
+    "max_val_pos":   200_000,
     # Degree cap for hub nodes in hard negative sampling (kept for reference)
     "hub_degree_cap": 2_000,
 }
@@ -99,21 +98,22 @@ LGBM_CONFIG = {
 }
 
 XGB_CONFIG = {
-    "n_estimators":    1000,
-    "learning_rate":   0.05,
-    "max_depth":       6,
-    "min_child_weight": 5,
-    "subsample":       0.8,
-    "colsample_bytree": 0.8,
-    "reg_alpha":       0.1,
-    "reg_lambda":      1.0,
-    "objective":       "binary:logistic",
-    "eval_metric":     "auc",
-    "use_label_encoder": False,
-    "tree_method":     "hist",
-    "device":          "cuda",      # GPU-accelerated tree building (XGBoost CUDA)
-    "n_jobs":          -1,
-    "random_state":    RANDOM_SEED,
+    "n_estimators":         2000,   # high cap; early stopping will find true optimum
+    "learning_rate":        0.05,
+    "max_depth":            6,
+    "min_child_weight":     5,
+    "subsample":            0.8,
+    "colsample_bytree":     0.8,
+    "reg_alpha":            0.1,
+    "reg_lambda":           1.0,
+    "objective":            "binary:logistic",
+    "eval_metric":          "auc",
+    "use_label_encoder":    False,
+    "tree_method":          "hist",
+    "device":               "cuda",      # GPU-accelerated tree building (XGBoost CUDA)
+    "early_stopping_rounds": 50,         # stop if val AUC doesn't improve for 50 rounds
+    "n_jobs":               -1,
+    "random_state":         RANDOM_SEED,
 }
 
 HGB_CONFIG = {

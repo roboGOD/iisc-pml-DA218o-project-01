@@ -1,0 +1,1 @@
+ params: {'max_depth': 3, 'min_child_weight': 9, 'subsample': 0.654795620827721, 'colsample_bytree': 0.629623197205584, 'learning_rate': 0.010294034637812999, 'reg_alpha': 0.3354011945830092, 'reg_lambda': 1.744320308321193, 'gamma': 0.12022289464728586, 'n_estimators': 102, 'val_auc': 0.9713393269199999}
